@@ -192,6 +192,74 @@ class CrossAttention(nn.Module):
         out = einsum('b i j, b j d -> b i d', sim, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
+    
+
+class MutualCrossAttention(nn.Module):
+    def __init__(self, query_dim, context1_dim=None, context2_dim=None, heads=8, dim_head=64, dropout=0.):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context1_dim = default(context1_dim, query_dim)
+        context2_dim = default(context2_dim, query_dim)
+
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+
+        self.to_q1 = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k1 = nn.Linear(context1_dim, inner_dim, bias=False)
+        self.to_v1 = nn.Linear(context1_dim, inner_dim, bias=False)
+
+        self.to_q2 = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k2 = nn.Linear(context2_dim, inner_dim, bias=False)
+        self.to_v2 = nn.Linear(context2_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x1, x2, context1=None, context2=None, mask1=None, mask2=None):
+        h = self.heads
+
+        q1 = self.to_q1(x1)
+        context1 = default(context1, x1)
+        k1 = self.to_k1(x1)
+        v1 = self.to_v1(x1)
+
+        q2 = self.to_q2(x2)
+        context2 = default(context2, x2)
+        k2 = self.to_k2(x2)
+        v2 = self.to_v2(x2)
+
+        q1, k1, v1 = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q1, k1, v1))
+        q2, k2, v2 = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q2, k2, v2))
+
+        k = torch.cat([k1, k2], dim=-2)
+        v = torch.cat([v1, v2], dim=-2)
+
+        # force cast to fp32 to avoid overflowing
+        if _ATTN_PRECISION =="fp32":
+            with torch.autocast(enabled=False, device_type = 'cuda'):
+                q1, k = q1.float(), k.float()
+                sim = einsum('b i d, b j d -> b i j', q1, k) * self.scale
+        else:
+            sim = einsum('b i d, b j d -> b i j', q1, k) * self.scale
+        
+        del q1, k
+    
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        # attention, what we cannot get enough of
+        sim = sim.softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', sim, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+
+
 
 
 class MemoryEfficientCrossAttention(nn.Module):
@@ -273,6 +341,65 @@ class BasicTransformerBlock(nn.Module):
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
+    
+class BasicMutualTransformerBlock(nn.Module):
+    ATTENTION_MODES = {
+        "softmax": [MutualCrossAttention, CrossAttention],  # vanilla attention
+        # "softmax-xformers": MemoryEfficientCrossAttention
+    }
+    def __init__(self, dim, n_heads, d_head, dropout=0., context1_dim=None, context2_dim=None, gated_ff=True, checkpoint=True,
+                 disable_self_attn=False):
+        super().__init__()
+        attn_mode = "softmax"
+        assert attn_mode in self.ATTENTION_MODES
+        mutual_attn_cls = self.ATTENTION_MODES[attn_mode][0]
+        attn_cls = self.ATTENTION_MODES[attn_mode][1]
+        self.disable_self_attn = disable_self_attn
+        self.mutual_attn1 = mutual_attn_cls(
+            query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout,
+            context1_dim=context1_dim if self.disable_self_attn else None,
+            context2_dim=context2_dim if self.disable_self_attn else None
+        )  # is a self-attention if not self.disable_self_attn
+        self.attn1 = attn_cls(
+            query_dim=dim, context_dim=context2_dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        )
+        self.mutual_ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.mutual_attn2 = mutual_attn_cls(
+            query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout,
+            context1_dim=context1_dim if self.disable_self_attn else None,
+            context2_dim=context2_dim if self.disable_self_attn else None
+        )  # is a self-attention if not self.disable_self_attn
+        self.attn2 = attn_cls(query_dim=dim, context_dim=context2_dim,
+                              heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        self.checkpoint = checkpoint
+    
+    def forward(self, x1, x2, context1=None, context2=None):
+        return checkpoint(self._forward, (x1, x2, context1, context2), self.parameters(), self.checkpoint)
+    
+    def _forward(self, x1, x2, context1=None, context2=None):
+        x1 = self.mutual_attn1(
+            self.norm1(x1), self.norm1(x2),
+            context1=context1 if self.disable_self_attn else None,
+            context2=context2 if self.disable_self_attn else None
+        ) + x1
+        x2 = self.attn1(
+            self.norm1(x2), context=context2 if self.disable_self_attn else None
+        ) + x2
+        x1 = self.mutual_attn2(
+            self.norm2(x1), self.norm2(x2),
+            context1=context1 if self.disable_self_attn else None,
+            context2=context2 if self.disable_self_attn else None
+        ) + x1
+        x2 = self.attn2(
+            self.norm2(x2), context=context2 if self.disable_self_attn else None
+        ) + x2
+        x1 = self.mutual_ff(self.norm3(x1)) + x1
+        x2 = self.ff(self.norm3(x2)) + x2
+        return x1, x2
 
 
 class SpatialTransformer(nn.Module):
@@ -338,4 +465,78 @@ class SpatialTransformer(nn.Module):
         if not self.use_linear:
             x = self.proj_out(x)
         return x + x_in
+
+
+class SpatialMutualTransformer(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.,
+        context1_dim=None,
+        context2_dim=None,
+        disable_self_attn=False,
+        use_linear=False,
+        use_checkpoint=True
+    ):
+        super().__init__()
+        if exists(context1_dim) and not isinstance(context1_dim, list):
+            context1_dim = [context1_dim]
+        if exists(context2_dim) and not isinstance(context2_dim, list):
+            context2_dim = [context2_dim]
+        
+        self.in_channels = in_channels
+        inner_dim = n_heads * d_head
+        self.norm = Normalize(in_channels)
+        if not use_linear:
+            self.proj_in1 = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
+            self.proj_in2 = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
+        else:
+            self.proj_in1 = nn.Linear(in_channels, inner_dim)
+            self.proj_in2 = nn.Linear(in_channels, inner_dim)
+        
+        self.transformer_blocks = nn.ModuleList(
+            [BasicMutualTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context1_dim=context2_dim[d], context2_dim=context2_dim[d],
+                                         disable_self_attn=disable_self_attn, checkpoint=use_checkpoint)
+                for d in range(depth)]
+        )
+
+        if not use_linear:
+            self.proj_out1 = zero_module(nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0))
+            self.proj_out2 = zero_module(nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0))
+        else:
+            self.proj_out1 = zero_module(nn.Linear(in_channels, inner_dim))
+            self.proj_out2 = zero_module(nn.Linear(in_channels, inner_dim))
+        self.use_linear = use_linear
+
+    def forward(self, x1, x2, context1=None, context2=None):
+        if not isinstance(context1, list):
+            context1 = [context1]
+        if not isinstance(context2, list):
+            context2 = [context2]
+        b, c, h, w = x1.shape
+        x_in1, x_in2 = x1, x2
+        x1 = self.norm(x1)
+        x2 = self.norm(x2)
+        if not self.use_linear:
+            x1 = self.proj_in1(x1)
+            x2 = self.proj_in2(x2)
+        x1 = rearrange(x1, 'b c h w -> b (h w) c').contiguous()
+        x2 = rearrange(x2, 'b c h w -> b (h w) c').contiguous()
+        if self.use_linear:
+            x1 = self.proj_in1(x1)
+            x2 = self.proj_in2(x2)
+        for i, block in enumerate(self.transformer_blocks):
+            x1, x2 = block(x1, x2, context1=context1[i], context2=context2[i])
+        if self.use_linear:
+            x1 = self.proj_out1(x1)
+            x2 = self.proj_out2(x2)
+        x1 = rearrange(x1, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+        x2 = rearrange(x2, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+        if not self.use_linear:
+            x1 = self.proj_out1(x1)
+            x2 = self.proj_out2(x2)
+        return x1 + x_in1, x2 + x_in2
 
