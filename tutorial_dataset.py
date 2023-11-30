@@ -11,7 +11,7 @@ class MyDataset(Dataset):
         self.data = []
 
         self.data_dir = '/home/wteng/data/sequence/training/'
-        with open(os.path.join(self.data_dir, 'prompt.json'), 'rt') as f:
+        with open(os.path.join(self.data_dir, 'prompts.json'), 'rt') as f:
             for line in f:
                 self.data.append(json.loads(line))
         f.close()
