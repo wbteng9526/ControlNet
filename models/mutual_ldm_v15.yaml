@@ -19,7 +19,7 @@ model:
     use_ema: False
 
     unet_config:
-      target: ldm.modules.diffusionmodules.openaimodel.MutualSourceUNetModel
+      target: ldm.modules.diffusionmodules.openaimodel.MutualAttentionUNetModel
       params:
         image_size: 32 # unused
         in_channels: 4
