@@ -1,5 +1,5 @@
 model:
-  target: cldm.attn_ldm.MutualAttentionLDM
+  target: cldm.attn_cldm.MutualAttentionLDM
   params:
     linear_start: 0.00085
     linear_end: 0.0120
@@ -9,6 +9,7 @@ model:
     first_stage_key: "jpg"
     cond_stage_key: "cond_jpg"
     mutual_key: "ref_jpg"
+    mutual_cond_stage_key: "txt"
     image_size: 64
     channels: 4
     cond_stage_trainable: false
@@ -30,7 +31,8 @@ model:
         num_heads: 8
         use_spatial_transformer: True
         transformer_depth: 1
-        context_dim: 768
+        context1_dim: 4
+        context2_dim: 768
         use_checkpoint: True
         legacy: False
 
@@ -55,6 +57,10 @@ model:
           attn_resolutions: []
           dropout: 0.0
         lossconfig:
-          target: torch.nn.Identity
+          target: ldm.modules.losses.LPIPSWithDiscriminator
+          params:
+            disc_start: 50001
+            kl_weight: 1.0e-06
+            disc_weight: 0.5
 
     cond_stage_config: __is_first_stage__

@@ -537,7 +537,10 @@ class SpatialMutualTransformer(nn.Module):
             x1 = self.proj_in1(x1)
             x2 = self.proj_in2(x2)
         for i, block in enumerate(self.transformer_blocks):
-            x1, x2 = block(x1, x2, context1=context1[i], context2=context2[i])
+            c1 = context1[i]
+            if exists(c):
+                c = rearrange(c, 'b c h w -> b (h w) c').contiguous()
+            x1, x2 = block(x1, x2, context1=c1, context2=context2[i])
         if self.use_linear:
             x1 = self.proj_out1(x1)
             x2 = self.proj_out2(x2)

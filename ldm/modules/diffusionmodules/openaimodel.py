@@ -86,7 +86,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 x = layer(x)
         return x
     
-class MutualTimestepEmbedSequential(nn.Sequential, TimestepBlock):
+class MutualTimestepEmbedSequential(list, TimestepBlock):
     def forward(self, x1, x2, emb1, emb2, context1=None, context2=None):
         for layers in self:
             if not isinstance(layers, list):
@@ -922,7 +922,7 @@ class UNetModel(nn.Module):
             return self.out(h)
 
 
-class MultiSourceUNetModel(nn.Module):
+class MutualSourceUNetModel(nn.Module):
     def __init__(
         self,
         image_size,
@@ -957,13 +957,15 @@ class MultiSourceUNetModel(nn.Module):
     ):
         super().__init__()
         if use_spatial_transformer:
-            assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
+            assert context1_dim is not None and context2_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
 
-        if context_dim is not None:
+        if context1_dim is not None or context2_dim is not None:
             assert use_spatial_transformer, 'Fool!! You forgot to use the spatial transformer for your cross-attention conditioning...'
             from omegaconf.listconfig import ListConfig
-            if type(context_dim) == ListConfig:
-                context_dim = list(context_dim)
+            if type(context1_dim) == ListConfig:
+                context1_dim = list(context1_dim)
+            if type(context2_dim) == ListConfig:
+                context2_dim = list(context2_dim)
 
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
@@ -1030,18 +1032,14 @@ class MultiSourceUNetModel(nn.Module):
             else:
                 raise ValueError()
         
-        self.input_blocks_t = nn.ModuleList(
+        layers = [
+            [conv_nd(dims, in_channels, model_channels, 3, padding=1),
+            conv_nd(dims, in_channels, model_channels, 3, padding=1)]
+        ]
+        self.input_blocks = nn.ModuleList(
             [
-                TimestepEmbedSequential(
-                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
-                )
-            ]
-        )
-
-        self.input_blocks_r = nn.ModuleList(
-            [
-                TimestepEmbedSequential(
-                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
+                MutualTimestepEmbedSequential(
+                    layers
                 )
             ]
         )
@@ -1100,12 +1098,12 @@ class MultiSourceUNetModel(nn.Module):
                                 num_head_channels=dim_head,
                                 use_new_attention_order=use_new_attention_order,
                             ) if not use_spatial_transformer else SpatialMutualTransformer(
-                                ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                                ch, num_heads, dim_head, depth=transformer_depth, context1_dim=context1_dim, context2_dim=context2_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint
                             )
                         ])
-                self.input_blocks.append(MutualTimestepEmbedSequential(*layers))
+                self.input_blocks.append(MutualTimestepEmbedSequential(layers))
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
@@ -1136,7 +1134,7 @@ class MultiSourceUNetModel(nn.Module):
                         )
                 self.input_blocks.append(
                     MutualTimestepEmbedSequential(
-                        [res_t, res_r]
+                        [[res_t, res_r]]
                     )
                 )
                 ch = out_ch
@@ -1186,7 +1184,7 @@ class MultiSourceUNetModel(nn.Module):
                 use_scale_shift_norm=use_scale_shift_norm,
             )
         
-        self.middle_block = TimestepEmbedSequential(
+        self.middle_block = MutualTimestepEmbedSequential([
             [res_t_m1, res_r_m1],
             [MutualAttentionBlock(
                 ch,
@@ -1195,12 +1193,12 @@ class MultiSourceUNetModel(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialMutualTransformer(  # always uses a self-attn
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                            ch, num_heads, dim_head, depth=transformer_depth, context1_dim=context1_dim, context2_dim=context2_dim,
                             disable_self_attn=disable_middle_self_attn, use_linear=use_linear_in_transformer,
                             use_checkpoint=use_checkpoint
                         )],
             [res_t_m2, res_r_m2],
-        )
+        ])
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
@@ -1254,7 +1252,7 @@ class MultiSourceUNetModel(nn.Module):
                                 num_head_channels=dim_head,
                                 use_new_attention_order=use_new_attention_order,
                             ) if not use_spatial_transformer else SpatialMutualTransformer(
-                                ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                                ch, num_heads, dim_head, depth=transformer_depth, context1_dim=context1_dim, context2_dim=context2_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint
                             )]
@@ -1285,7 +1283,7 @@ class MultiSourceUNetModel(nn.Module):
                         [res_t, res_r]
                     )
                     ds //= 2
-                self.output_blocks.append(MutualTimestepEmbedSequential(*layers))
+                self.output_blocks.append(MutualTimestepEmbedSequential(layers))
                 self._feature_size += ch
 
         self.out = nn.Sequential(
@@ -1299,6 +1297,22 @@ class MultiSourceUNetModel(nn.Module):
             conv_nd(dims, model_channels, n_embed, 1),
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
+    
+    def convert_to_fp16(self):
+        """
+        Convert the torso of the model to float16.
+        """
+        self.input_blocks.apply(convert_module_to_f16)
+        self.middle_block.apply(convert_module_to_f16)
+        self.output_blocks.apply(convert_module_to_f16)
+
+    def convert_to_fp32(self):
+        """
+        Convert the torso of the model to float32.
+        """
+        self.input_blocks.apply(convert_module_to_f32)
+        self.middle_block.apply(convert_module_to_f32)
+        self.output_blocks.apply(convert_module_to_f32)
     
     def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, y=None, **kwargs):
         """
