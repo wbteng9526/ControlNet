@@ -801,13 +801,12 @@ class LatentDiffusion(DDPM):
                 c = {ckey: c, 'pos_x': pos_x, 'pos_y': pos_y}
 
         else:
-            c = None 
+            c = None
             xc = None
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
         out = [z, c]
-        # print(z.shape, c.shape)
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -846,7 +845,6 @@ class LatentDiffusion(DDPM):
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        # print(x.shape, c.shape)
         return self.p_losses(x, c, t, *args, **kwargs)
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
