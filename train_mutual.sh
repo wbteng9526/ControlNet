@@ -1,3 +1,3 @@
-CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=6
 
 python train_mutual_img2img.py

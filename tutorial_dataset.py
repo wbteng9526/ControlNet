@@ -63,6 +63,7 @@ class MyMutualDataset(Dataset):
 
         source_filename = item['source']
         target_filename = item['target']
+        prompt = item['prompt']
         
         source_img = cv2.imread(self.data_dir + source_filename + '.png')
         target_img = cv2.imread(self.data_dir + target_filename + '.png')
@@ -80,7 +81,7 @@ class MyMutualDataset(Dataset):
         # reference image
         reference_range = self.frame_range
         source_seq_id, _, _, source_frame_id = source_filename.split("/")
-        source_seq_length = len(os.listdir(os.path.join(self.data_dir, source_seq_id)))
+        source_seq_length = len(os.listdir(os.path.join(self.data_dir, source_seq_id, "target", "image")))
         if source_seq_length < reference_range:
             reference_range = source_seq_length
         
@@ -96,31 +97,31 @@ class MyMutualDataset(Dataset):
         
         ref_frame_ids = list(range(start_id, end_id))
         ref_id = random.choice(ref_frame_ids)
-        ref_filename = source_seq_id + "/target/image/frame_" + ":06d".format(ref_id)
+        ref_filename = source_seq_id + "/target/image/frame_" + f"{ref_id:06d}"
 
         ref_img = cv2.imread(self.data_dir + ref_filename + '.png')
         ref_img = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
 
         ref_img = (ref_img.astype(np.float32) / 127.5) - 1.0
         
-        source_camfile = source_seq_id + "/target/camera/" + source_frame_id + ".json"
-        with open(source_camfile, 'r') as f:
-            source_cam = json.loads(f)
+        # source_camfile = self.data_dir + source_seq_id + "/target/camera/" + source_frame_id + ".json"
+        # with open(source_camfile, 'r') as f:
+        #     source_cam = json.loads(f)
         
-        source_ext = np.array(source_cam['transform_matrix'])
-        source_center = source_ext[:3, 3]
+        # source_ext = np.array(source_cam['transform_matrix'])
+        # source_center = source_ext[:3, 3]
 
-        ref_camfile = source_seq_id + '/target/camera/frame_' + ":06d.json".format(ref_id)
-        with open(ref_camfile, 'r') as f:
-            ref_cam = json.loads(f)
+        # ref_camfile = source_seq_id + '/target/camera/frame_' + f"{ref_id:06d}.json"
+        # with open(ref_camfile, 'r') as f:
+        #     ref_cam = json.loads(f)
         
-        ref_ext = np.array(ref_cam['transform_matrix'])
-        ref_center = ref_ext[:3, 3]
+        # ref_ext = np.array(ref_cam['transform_matrix'])
+        # ref_center = ref_ext[:3, 3]
 
-        forward = "forward" if ref_center[0] - source_center[0] >= 0 else "backward"
-        dis = np.sqrt(np.sum(ref_center - source_center) ** 2)
+        # forward = "forward" if ref_center[0] - source_center[0] >= 0 else "backward"
+        # dis = np.sqrt(np.sum(ref_center - source_center) ** 2)
 
-        prompt = f"a realistic street view image with the same scene as the target image but only {dis} meters {forward} away from the target"
+        # prompt = f"a realistic street view image with the same scene as the target image but only {dis} meters {forward} away from the target"
 
         return dict(jpg=target_img, txt=prompt, cond_jpg=source_img, ref_jpg=ref_img)
 

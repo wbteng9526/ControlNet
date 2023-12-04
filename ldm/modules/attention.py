@@ -198,7 +198,7 @@ class CrossAttention(nn.Module):
 
 class SharedCrossAttention(CrossAttention):
     def __init__(self, shared_kv, return_kv, *args, **kwargs):
-        super().__init__()
+        super().__init__(*args, **kwargs)
         assert isinstance(shared_kv, bool) and isinstance(return_kv, bool)
         assert shared_kv != return_kv
         self.return_kv = return_kv
@@ -216,6 +216,8 @@ class SharedCrossAttention(CrossAttention):
 
         if self.shared_kv:
             assert shared_k is not None and shared_v is not None
+            shared_k = rearrange(shared_k, 'b d i -> b i d')
+            shared_v = rearrange(shared_v, 'b d i -> b i d')
             k = torch.cat([k, shared_k], dim=-2)
             v = torch.cat([v, shared_v], dim=-2)
         # force cast to fp32 to avoid overflowing
@@ -226,7 +228,7 @@ class SharedCrossAttention(CrossAttention):
         else:
             sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
         
-        del q, k
+        del q
     
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -240,10 +242,10 @@ class SharedCrossAttention(CrossAttention):
         out = einsum('b i j, b j d -> b i d', sim, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
 
-        # if self.return_kv:
-        return self.to_out(out), k, v
-        # else:
-            # return self.to_out(out)
+        if self.return_kv:
+            return self.to_out(out), k, v
+        else:
+            return self.to_out(out)
     
 
 class MutualCrossAttention(nn.Module):
@@ -569,11 +571,15 @@ class SpatialTransformer(nn.Module):
 
 
 class SharedSpatialTransformer(SpatialTransformer):
-    def __init__(self, context_dim, depth=1, shared_kv=True, return_kv=False, *args, **kwargs):
-        super().__init__()
+    def __init__(self, return_kv=True, dropout=0., shared_kv=False, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if exists(kwargs['context_dim']) and not isinstance(kwargs['context_dim'], list):
+            context_dim = [kwargs['context_dim']]
+        inner_dim = kwargs['n_heads'] * kwargs['d_head']
         self.transformer_blocks = nn.ModuleList([
-            BasicSharedTransformerBlock(context_dim=context_dim[d], shared_kv=shared_kv, return_kv=return_kv, 
-                                        *args, **kwargs) for d in range(depth)
+            BasicSharedTransformerBlock(inner_dim, kwargs['n_heads'], kwargs['d_head'], dropout=dropout, context_dim=context_dim[d],
+                                   disable_self_attn=kwargs["disable_self_attn"], checkpoint=kwargs["use_checkpoint"], shared_kv=shared_kv, return_kv=return_kv) 
+                                   for d in range(kwargs["depth"])
         ])
         self.return_kv = return_kv
         self.shared_kv = shared_kv
@@ -581,6 +587,10 @@ class SharedSpatialTransformer(SpatialTransformer):
     def forward(self, x, shared_k=None, shared_v=None, context=None):
         if not isinstance(context, list):
             context = [context]
+        if not isinstance(shared_k, list):
+            shared_k = [shared_k]
+        if not isinstance(shared_v, list):
+            shared_v = [shared_v]
         # print(x.shape, context[0].shape)
         b, c, h, w = x.shape
         x_in = x
@@ -590,7 +600,6 @@ class SharedSpatialTransformer(SpatialTransformer):
         x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         if self.use_linear:
             x = self.proj_in(x)
-        
         if self.return_kv:
             ks, vs = [], []
         for i, block in enumerate(self.transformer_blocks):
@@ -601,7 +610,8 @@ class SharedSpatialTransformer(SpatialTransformer):
                 x, k, v = block(x)
                 ks.append(k)
                 vs.append(v)
-            x = block(x, shared_k[i], shared_v[i], context=c)
+            else:
+                x = block(x, shared_k[i], shared_v[i], context=c)
         if self.use_linear:
             x = self.proj_out(x)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()

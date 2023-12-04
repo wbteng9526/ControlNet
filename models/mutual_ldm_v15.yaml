@@ -1,5 +1,5 @@
 model:
-  target: cldm.attn_cldm.MutualAttentionLDM
+  target: ldm.models.diffusion.ddpm.MutualAttentionLDM
   params:
     linear_start: 0.00085
     linear_end: 0.0120
@@ -32,7 +32,7 @@ model:
         use_spatial_transformer: True
         transformer_depth: 1
         context1_dim: 4
-        context2_dim: None
+        context2_dim: 768
         use_checkpoint: True
         legacy: False
 

@@ -16,7 +16,7 @@ from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from ldm.modules.attention import SpatialTransformer
 from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
-from ldm.models.diffusion.ddpm import LatentDiffusion, DiffusionWrapper
+from ldm.models.diffusion.ddpm import LatentDiffusion, MutualDiffusionWrapper
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 
@@ -33,15 +33,16 @@ class MutualAttentionLDM(LatentDiffusion):
 
     def __init__(self, mutual_key, mutual_cond_stage_key, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.model = MutualDiffusionWrapper(kwargs['unet_config'], kwargs['conditioning_key'])
         self.mutual_key = mutual_key
         self.mutual_cond_stage_key = mutual_cond_stage_key
 
     @torch.no_grad()
     def get_input(self, batch, *args, **kwargs):
         x_t, c_t = super().get_input(batch, self.first_stage_key, *args, **kwargs)
-        x_r, c_r = super().get_input(batch, self.mutual_key, cond_key=self.mutual_cond_stage_key, *args, **kwargs)
+        x_r, c_r = super().get_input(batch, self.mutual_key, cond_key=self.first_stage_key, *args, **kwargs) # TODO change to other conditions
         c_r = None # TODO add camera delta R and delta T like zero-123
-        return x_t, x_r, dict(c_crossattn=[c_t]), dict(c_crossattn=[c_r])
+        return x_t, x_r, dict(c_t_crossattn=[c_t]), dict(c_r_crossattn=[c_r])
     
     def shared_step(self, batch, *args, **kwargs):
         x_t, x_r, c_t, c_r = self.get_input(batch, *args, *kwargs)
@@ -51,9 +52,9 @@ class MutualAttentionLDM(LatentDiffusion):
     def forward(self, x_t, x_r, c_t, c_r, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x_t.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
-            assert c is not None
+            assert c_t is not None
             if self.cond_stage_trainable:
-                c = self.get_learned_conditioning(c)
+                c_t = self.get_learned_conditioning(c_t)
         return self.p_losses(x_t, x_r, c_t, c_r, t, *args, **kwargs)
     
     def apply_model(self, x_t_noisy, x_r, t, cond_t, cond_r, return_ids=False):

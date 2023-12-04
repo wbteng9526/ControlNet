@@ -120,6 +120,25 @@ class MutualTimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 x1, x2 = layer(x1, x2)
         return x1, x2
 
+class SharedTimestepEmbedSequential(nn.Sequential, TimestepBlock):
+    def forward(self, x, emb, context=None, shared_k=None, shared_v=None):
+        k, v = None, None
+        for layer in self:
+            if isinstance(layer, TimestepBlock):
+                x = layer(x, emb)
+            elif isinstance(layer, SharedSpatialTransformer):
+                x = layer(x, shared_k, shared_v, context=context)
+                if isinstance(x, tuple):
+                    x, k, v = x
+            elif isinstance(layer, SharedAttentionBlock):
+                x = layer(x, shared_k, shared_v)
+                if isinstance(x, tuple):
+                    x, k, v = x
+            else:
+                x = layer(x)
+        if exists(k) and exists(v):
+            return x, k, v
+        return x
 
 class Upsample(nn.Module):
     """
@@ -357,6 +376,111 @@ class AttentionBlock(nn.Module):
         return (x + h).reshape(b, c, *spatial)
 
 
+class MutualAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        channels,
+        num_heads=1,
+        num_head_channels=-1,
+        use_checkpoint=False,
+        use_new_attention_order=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert (
+                channels % num_head_channels == 0
+            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+            self.num_heads = channels // num_head_channels
+        self.use_checkpoint = use_checkpoint
+        self.norm1 = normalization(channels)
+        self.norm2 = normalization(channels)
+        self.qkv1 = conv_nd(1, channels, channels * 3, 1)
+        self.qkv2 = conv_nd(1, channels, channels * 3, 1)
+        if use_new_attention_order:
+            # split qkv before split heads
+            self.attention1 = QKVAttention(self.num_heads)
+            self.attention2 = QKVAttention(self.num_heads)
+        else:
+            # split heads before split qkv
+            self.attention1 = QKVAttentionLegacy(self.num_heads)
+            self.attention2 = QKVAttentionLegacy(self.num_heads)
+
+        self.proj_out1 = zero_module(conv_nd(1, channels, channels, 1))
+        self.proj_out2 = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x1, x2):
+        return checkpoint(self._forward, (x1, x2), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        #return pt_checkpoint(self._forward, x)  # pytorch
+
+    def _forward(self, x1, x2):
+        assert x1.shape == x2.shape
+        b, c, *spatial = x1.shape
+        x1 = x1.reshape(b, c, -1)
+        x2 = x2.reshape(b, c, -1)
+        qkv1 = self.qkv1(self.norm1(x1))
+        qkv2 = self.qkv2(self.norm2(x2))
+        h1, h2 = self.attention(qkv1, qkv2)
+        h1 = self.proj_out(h1)
+        h2 = self.proj_out(h2)
+        return (x1 + h1).reshape(b, c, *spatial), (x2 + h2).reshape(b, c, *spatial)
+
+
+class SharedAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        channels,
+        num_heads=1,
+        num_head_channels=-1,
+        use_checkpoint=False,
+        use_new_attention_order=False,
+        shared_kv=True,
+        return_kv=False
+    ):
+        super().__init__()
+        self.channels = channels
+        self.return_kv = return_kv
+        self.shared_kv = shared_kv
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert (
+                channels % num_head_channels == 0
+            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+            self.num_heads = channels // num_head_channels
+        self.use_checkpoint = use_checkpoint
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)
+        if use_new_attention_order:
+            # split qkv before split heads
+            self.attention = SharedQKVAttention(self.num_heads, shared_kv=shared_kv, return_kv=return_kv)
+        else:
+            # split heads before split qkv
+            self.attention = SharedQKVAttentionLegacy(self.num_heads, shared_kv=shared_kv, return_kv=return_kv)
+
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x, shared_k=None, shared_v=None):
+        return checkpoint(self._forward, (x, shared_k, shared_v), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        #return pt_checkpoint(self._forward, x)  # pytorch
+
+    def _forward(self, x, shared_k=None, shared_v=None):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        if self.shared_kv:
+            h = self.attention(qkv, shared_k, shared_v)
+        else:
+            h, k, v = self.attention(qkv)
+        h = self.proj_out(h)
+        if self.return_kv:
+            return (x + h).reshape(b, c, *spatial), k, v
+        else:
+            return (x + h).reshape(b, c, *spatial)
+
+
 def count_flops_attn(model, _x, y):
     """
     A counter for the `thop` package to count the operations in an
@@ -441,6 +565,42 @@ class MutualQKVAttentionLegacy(nn.Module):
         return a1.reshape(bs, -1, length), a2.reshape(bs, -1, length)
 
 
+class SharedQKVAttentionLegacy(nn.Module):
+    def __init__(self, n_heads, shared_kv=True, return_kv=False):
+        super().__init__()
+        self.n_heads = n_heads
+        self.return_kv = return_kv
+        self.shared_kv = shared_kv
+    
+    def forward(self, qkv, shared_k=None, shared_v=None):
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+        # print(qkv.shape, k.shape)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+
+        if self.shared_kv:
+            assert shared_k is not None
+            weight = th.einsum(
+                "bct,bcs->bts", q * scale, th.cat([k, shared_k], dim=-2) * scale
+            )  # More stable with f16 than dividing afterwards
+        else:
+            weight = th.einsum(
+                "bct,bcs->bts", q * scale, k * scale
+            )  # More stable with f16 than dividing afterwards
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+
+        if self.shared_kv:
+            a = th.einsum("bts,bcs->bct", weight, th.cat([v, shared_v], dim=-2))
+        else:
+            a = th.einsum("bts,bcs->bct", weight, v)
+        
+        if self.return_kv:
+            return a.reshape(bs, -1, length), k, v
+        return a.reshape(bs, -1, length)
+
+
 class QKVAttention(nn.Module):
     """
     A module which performs QKV attention and splits in a different order.
@@ -508,56 +668,52 @@ class MutualQKVAttention(nn.Module):
 
         return a1.reshape(bs, -1, length), a2.reshape(bs, -1, length)
 
-class MutualAttentionBlock(nn.Module):
-    def __init__(
-        self,
-        channels,
-        num_heads=1,
-        num_head_channels=-1,
-        use_checkpoint=False,
-        use_new_attention_order=False,
-    ):
+
+class SharedQKVAttention(nn.Module):
+    """
+    A module which performs QKV attention and splits in a different order.
+    """
+    def __init__(self, n_heads, shared_kv=True, return_kv=False):
         super().__init__()
-        self.channels = channels
-        if num_head_channels == -1:
-            self.num_heads = num_heads
+        self.n_heads = n_heads
+        self.return_kv = return_kv
+        self.shared_kv = shared_kv
+
+    def forward(self, qkv, shared_k=None, shared_v=None):
+        """
+        Apply QKV attention.
+        :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x (H * C) x T] tensor after attention.
+        """
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.chunk(3, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+
+        if self.shared_kv:
+            weight = th.einsum(
+                "bct,bcs->bts",
+                (q * scale).view(bs * self.n_heads, ch, length),
+                (th.cat([k, shared_k], dim=-2) * scale).view(bs * self.n_heads, ch, length),
+            )  # More stable with f16 than dividing afterwards
         else:
-            assert (
-                channels % num_head_channels == 0
-            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
-            self.num_heads = channels // num_head_channels
-        self.use_checkpoint = use_checkpoint
-        self.norm1 = normalization(channels)
-        self.norm2 = normalization(channels)
-        self.qkv1 = conv_nd(1, channels, channels * 3, 1)
-        self.qkv2 = conv_nd(1, channels, channels * 3, 1)
-        if use_new_attention_order:
-            # split qkv before split heads
-            self.attention1 = QKVAttention(self.num_heads)
-            self.attention2 = QKVAttention(self.num_heads)
+            weight = th.einsum(
+                "bct,bcs->bts",
+                (q * scale).view(bs * self.n_heads, ch, length),
+                (k * scale).view(bs * self.n_heads, ch, length),
+            )  # More stable with f16 than dividing afterwards
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+
+        if self.shared_kv:
+            a = th.einsum("bts,bcs->bct", weight, th.cat([v, shared_v], dim=-2).reshape(bs * self.n_heads, ch, length))
         else:
-            # split heads before split qkv
-            self.attention1 = QKVAttentionLegacy(self.num_heads)
-            self.attention2 = QKVAttentionLegacy(self.num_heads)
+            a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        
+        if self.return_kv:
+            return a.reshape(bs, -1, length), k, v
+        return a.reshape(bs, -1, length)
 
-        self.proj_out1 = zero_module(conv_nd(1, channels, channels, 1))
-        self.proj_out2 = zero_module(conv_nd(1, channels, channels, 1))
-
-    def forward(self, x1, x2):
-        return checkpoint(self._forward, (x1, x2), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
-        #return pt_checkpoint(self._forward, x)  # pytorch
-
-    def _forward(self, x1, x2):
-        assert x1.shape == x2.shape
-        b, c, *spatial = x1.shape
-        x1 = x1.reshape(b, c, -1)
-        x2 = x2.reshape(b, c, -1)
-        qkv1 = self.qkv1(self.norm1(x1))
-        qkv2 = self.qkv2(self.norm2(x2))
-        h1, h2 = self.attention(qkv1, qkv2)
-        h1 = self.proj_out(h1)
-        h2 = self.proj_out(h2)
-        return (x1 + h1).reshape(b, c, *spatial), (x2 + h2).reshape(b, c, *spatial)
 
 class UNetModel(nn.Module):
     """
@@ -1068,14 +1224,13 @@ class MutualAttentionUNetBlock(nn.Module):
             else:
                 raise ValueError()
 
-        # self.input_blocks = nn.ModuleList(
-        #     [
-        #         # TimestepEmbedSequential(
-        #             conv_nd(dims, in_channels, model_channels, 3, padding=1)
-        #         # )
-        #     ]
-        # )
-        self.input_blocks = [conv_nd(dims, in_channels, model_channels, 3, padding=1)]
+        self.input_blocks = nn.ModuleList(
+            [
+                SharedTimestepEmbedSequential(
+                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
+                )
+            ]
+        )
         self._feature_size = model_channels
         input_block_chans = [model_channels]
         ch = model_channels
@@ -1111,41 +1266,45 @@ class MutualAttentionUNetBlock(nn.Module):
                     if not exists(num_attention_blocks) or nr < num_attention_blocks[level]:
                         layers.append(
                             SharedSpatialTransformer(
-                                ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                                shared_kv=shared_kv, return_kv=return_kv, in_channels=ch, n_heads=num_heads, d_head=dim_head, depth=transformer_depth, context_dim=context_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
-                                use_checkpoint=use_checkpoint, shared_kv=shared_kv, return_kv=return_kv
-                            )
+                                use_checkpoint=use_checkpoint
+                    ) if use_spatial_transformer else SharedAttentionBlock(ch,
+                                use_checkpoint=use_checkpoint,
+                                num_heads=num_heads,
+                                num_head_channels=dim_head,
+                                use_new_attention_order=use_new_attention_order, return_kv=return_kv, shared_kv=shared_kv)
                         )
-                # self.input_blocks.append(TimestepEmbedSequential(*layers))
-                self.input_blocks += layers
+                self.input_blocks.append(SharedTimestepEmbedSequential(*layers))
+                # self.input_blocks += layers
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
                 out_ch = ch
                 self.input_blocks.append(
-        
-                    ResBlock(
-                        ch,
-                        time_embed_dim,
-                        dropout,
-                        out_channels=out_ch,
-                        dims=dims,
-                        use_checkpoint=use_checkpoint,
-                        use_scale_shift_norm=use_scale_shift_norm,
-                        down=True,
+                    SharedTimestepEmbedSequential(
+                        ResBlock(
+                            ch,
+                            time_embed_dim,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            use_scale_shift_norm=use_scale_shift_norm,
+                            down=True,
+                        )
+                        if resblock_updown
+                        else Downsample(
+                            ch, conv_resample, dims=dims, out_channels=out_ch
+                        )
                     )
-                    if resblock_updown
-                    else Downsample(
-                        ch, conv_resample, dims=dims, out_channels=out_ch
-                    )
-                    
                 )
                 ch = out_ch
                 input_block_chans.append(ch)
                 ds *= 2
                 self._feature_size += ch
 
-        self.input_blocks = nn.ModuleList(self.input_blocks)
+        # self.input_blocks = nn.ModuleList(self.input_blocks)
         if num_head_channels == -1:
             dim_head = ch // num_heads
         else:
@@ -1154,7 +1313,7 @@ class MutualAttentionUNetBlock(nn.Module):
         if legacy:
             #num_heads = 1
             dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
-        self.middle_block = nn.ModuleList([
+        self.middle_block = SharedTimestepEmbedSequential(
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -1164,9 +1323,14 @@ class MutualAttentionUNetBlock(nn.Module):
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
             SharedSpatialTransformer(  # always uses a self-attn
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                            shared_kv=shared_kv, return_kv=return_kv, in_channels=ch, n_heads=num_heads, d_head=dim_head, depth=transformer_depth, context_dim=context_dim,
                             disable_self_attn=disable_middle_self_attn, use_linear=use_linear_in_transformer,
-                            use_checkpoint=use_checkpoint, shared_kv=shared_kv, return_kv=return_kv
+                            use_checkpoint=use_checkpoint
+                        ) if use_spatial_transformer else SharedAttentionBlock(ch,
+                                use_checkpoint=use_checkpoint,
+                                num_heads=num_heads,
+                                num_head_channels=dim_head,
+                                use_new_attention_order=use_new_attention_order, return_kv=return_kv, shared_kv=shared_kv
                         ),
             ResBlock(
                 ch,
@@ -1176,10 +1340,10 @@ class MutualAttentionUNetBlock(nn.Module):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
-        ])
+        )
         self._feature_size += ch
 
-        self.output_blocks = [] #nn.ModuleList([])
+        self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(self.num_res_blocks[level] + 1):
                 ich = input_block_chans.pop()
@@ -1212,10 +1376,14 @@ class MutualAttentionUNetBlock(nn.Module):
                     if not exists(num_attention_blocks) or i < num_attention_blocks[level]:
                         layers.append(
                             SharedSpatialTransformer(
-                                ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                                shared_kv=shared_kv, return_kv=return_kv, in_channels=ch, n_heads=num_heads, d_head=dim_head, depth=transformer_depth, context_dim=context_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
-                                use_checkpoint=use_checkpoint, shared_kv=shared_kv, return_kv=return_kv
-                            )
+                                use_checkpoint=use_checkpoint
+                            ) if use_spatial_transformer else SharedAttentionBlock(ch,
+                                use_checkpoint=use_checkpoint,
+                                num_heads=num_heads,
+                                num_head_channels=dim_head,
+                                use_new_attention_order=use_new_attention_order, return_kv=return_kv, shared_kv=shared_kv)
                         )
                 if level and i == self.num_res_blocks[level]:
                     out_ch = ch
@@ -1234,10 +1402,10 @@ class MutualAttentionUNetBlock(nn.Module):
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                     ds //= 2
-                self.output_blocks += layers # append(TimestepEmbedSequential(*layers))
+                self.output_blocks.append(SharedTimestepEmbedSequential(*layers))
                 self._feature_size += ch
         
-        self.output_blocks = nn.ModuleList(self.output_blocks)
+        # self.output_blocks = nn.ModuleList(self.output_blocks)
 
         self.out = nn.Sequential(
             normalization(ch),
@@ -1301,46 +1469,6 @@ class MutualAttentionUNetBlock(nn.Module):
         else:
             return self.out(h)
 
-
-
-class UNetBlock(UNetModel):
-    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
-        """
-        Apply the model to an input batch.
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param context: conditioning plugged in via crossattn
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        assert (y is not None) == (
-            self.num_classes is not None
-        ), "must specify y if and only if the model is class-conditional"
-        hs, hs_trans = [], []
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
-        emb = self.time_embed(t_emb)
-
-        if self.num_classes is not None:
-            assert y.shape[0] == x.shape[0]
-            emb = emb + self.label_emb(y)
-
-        h = x.type(self.dtype)
-        for module in self.input_blocks:
-            h = module(h, emb, context)
-            hs.append(h)
-            if isinstance(module, SpatialTransformer) or isinstance(module, AttentionBlock):
-                hs_trans.append(h)
-        h = self.middle_block(h, emb, context)
-        for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
-            if isinstance(module, SpatialTransformer) or isinstance(module, AttentionBlock):
-                hs_trans.append(h)
-        h = h.type(x.dtype)
-        if self.predict_codebook_ids:
-            return self.id_predictor(h), hs_trans
-        else:
-            return self.out(h), hs_trans
 
 
 class MutualAttentionUNetModel(nn.Module):
@@ -1429,9 +1557,9 @@ class MutualAttentionUNetModel(nn.Module):
             use_scale_shift_norm=use_scale_shift_norm,
             resblock_updown=resblock_updown,
             use_new_attention_order=use_new_attention_order,
-            use_spatial_transformer=use_spatial_transformer,
+            use_spatial_transformer= not use_spatial_transformer,
             transformer_depth=transformer_depth,
-            context_dim=context2_dim,
+            context_dim=None,
             n_embed=n_embed,
             legacy=legacy,
             disable_self_attentions=disable_self_attentions,
@@ -1443,57 +1571,75 @@ class MutualAttentionUNetModel(nn.Module):
         )
 
     def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, y=None,**kwargs):
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        t_emb = timestep_embedding(timesteps, self.unet_target.model_channels, repeat_only=False)
         emb_t = self.unet_target.time_embed(t_emb)
         emb_r = self.unet_reference.time_embed(t_emb)
 
         hs_t, hs_r = [], []
-        h_t, h_r = x_t.type(self.dtype), x_r.type(self.dtype)
+        h_t, h_r = x_t.type(self.unet_target.dtype), x_r.type(self.unet_reference.dtype)
 
+        k_r, v_r = None, None
         for m_t, m_r in zip(self.unet_target.input_blocks, self.unet_reference.input_blocks):
-            if isinstance(m_t, TimestepBlock):
-                h_t = m_t(h_t, emb_t)
-            if isinstance(m_r, TimestepBlock):
-                h_r = m_r(h_r, emb_r)
-            elif isinstance(m_r, SharedSpatialTransformer):
-                h_r, k_r, v_r = m_r(h_r, context_r)
-            if isinstance(m_t, SharedSpatialTransformer):
-                h_t = m_t(h_t, k_r, v_r, context_t)
-            else:
-                h_r = m_r(h_r)
-                h_t = m_t(h_t)
+            # if isinstance(m_t, TimestepBlock) and isinstance(m_r, TimestepBlock):
+            #     h_t = m_t(h_t, emb_t)
+            #     h_r = m_r(h_r, emb_r)
+            # elif isinstance(m_r, SharedSpatialTransformer) and isinstance(m_t, SharedSpatialTransformer):
+            #     h_r, k_r, v_r = m_r(h_r, context=context_r)
+            #     h_t = m_t(h_t, k_r, v_r, context=context_t)
+            # elif isinstance(m_r, SharedAttentionBlock) and isinstance(m_t, SharedSpatialTransformer):
+            #     h_r, k_r, v_r = m_r(h_r)
+            #     h_t = m_t(h_t, k_r, v_r, context=context_t)
+            # else:
+            #     h_t = m_t(h_t)
+            #     h_r = m_r(h_r)
+            h_r = m_r(h_r, emb_r, context=context_r)
+            if isinstance(h_r, tuple):
+                h_r, k_r, v_r = h_r
+            h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             hs_t.append(h_t)
             hs_r.append(h_r)
         
-        for m_t, m_r in zip(self.unet_target.middle_block, self.unet_reference.middle_block):
-            if isinstance(m_t, TimestepBlock):
-                h_t = m_t(h_t, emb_t)
-            if isinstance(m_r, TimestepBlock):
-                h_r = m_r(h_r, emb_r)
-            elif isinstance(m_r, SharedSpatialTransformer):
-                h_r, k_r, v_r = m_r(h_r, context_r)
-            if isinstance(m_t, SharedSpatialTransformer):
-                h_t = m_t(h_t, k_r, v_r, context_t)
-            else:
-                h_r = m_r(h_r)
-                h_t = m_t(h_t)
+        # for m_t, m_r in zip(self.unet_target.middle_block, self.unet_reference.middle_block):
+        #     if isinstance(m_t, TimestepBlock) and isinstance(m_r, TimestepBlock):
+        #         h_t = m_t(h_t, emb_t)
+        #         h_r = m_r(h_r, emb_r)
+        #     elif isinstance(m_r, SharedSpatialTransformer) and isinstance(m_t, SharedSpatialTransformer):
+        #         h_r, k_r, v_r = m_r(h_r, context=context_r)
+        #         h_t = m_t(h_t, k_r, v_r, context=context_t)
+        #     elif isinstance(m_r, SharedAttentionBlock) and isinstance(m_t, SharedSpatialTransformer):
+        #         h_r, k_r, v_r = m_r(h_r)
+        #         h_t = m_t(h_t, k_r, v_r, context=context_t)
+        #     else:
+        #         h_t = m_t(h_t)
+        #         h_r = m_r(h_r)
+        h_r = self.unet_reference.middle_block(h_r, emb_r, context=context_r)
+        if isinstance(h_r, tuple):
+            h_r, k_r, v_r = h_r
+        h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
         
+        # print([h.shape for h in hs_r])
         for m_t, m_r in zip(self.unet_target.output_blocks, self.unet_reference.output_blocks):
-            if isinstance(m_t, TimestepBlock):
-                h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t)
-            if isinstance(m_r, TimestepBlock):
-                h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r)
-            elif isinstance(m_r, SharedSpatialTransformer):
-                h_r, k_r, v_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), context_r)
-            if isinstance(m_t, SharedSpatialTransformer):
-                h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), k_r, v_r, context_t)
-            else:
-                h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1))
-                h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1))
+            # print(m_t.named_modules)
+            # if isinstance(m_t, TimestepBlock) and isinstance(m_r, TimestepBlock):
+            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t)
+            #     h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r)
+            # elif isinstance(m_r, SharedSpatialTransformer) and isinstance(m_t, SharedSpatialTransformer):
+            #     h_r, k_r, v_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), context=context_r)
+            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), k_r, v_r, context=context_t)
+            # elif isinstance(m_r, SharedAttentionBlock) and isinstance(m_t, SharedSpatialTransformer):
+            #     h_r, k_r, v_r = m_r(th.cat([h_r, hs_r.pop()], dim=1))
+            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), context=context_t)
+            # else:
+            #     h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1))
+            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1))
+            h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r, context=context_r)
+            if isinstance(h_r, tuple):
+                h_r, k_r, v_r = h_r
+            h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
 
 
         h_r, h_t = h_r.type(x_r.dtype), h_t.type(x_t.dtype)
-        if self.predict_codebook_ids:
-            return self.id_predictor(h_t)
+        if self.unet_target.predict_codebook_ids:
+            return self.unet_target.id_predictor(h_t)
         else:
-            return self.out(h_t)
+            return self.unet_target.out(h_t)
