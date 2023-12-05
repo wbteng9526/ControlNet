@@ -327,6 +327,45 @@ class ResBlock(TimestepBlock):
         return self.skip_connection(x) + h
 
 
+class ResBlockLocationAware(ResBlock):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loc_emb_layers = nn.Sequential(
+            nn.SiLU(),
+            linear(
+                args[1],
+                2 * self.out_channels if kwargs["use_scale_shift_norm"] else self.out_channels,
+            ),
+        )
+
+    def _forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+        
+        time_emb, loc_emb = th.chunk(emb, chunks=2, dim=1)
+        time_emb_out = self.time_emb_layers(time_emb).type(h.dtype)
+        loc_emb_out = self.loc_emb_layers(loc_emb).type(h.dtype)
+        while len(time_emb_out.shape) < len(h.shape):
+            time_emb_out = time_emb_out[..., None]
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = th.chunk(time_emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + time_emb_out + loc_emb_out
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
+
+
+
 class AttentionBlock(nn.Module):
     """
     An attention block that allows spatial positions to attend to each other.
@@ -1153,7 +1192,8 @@ class MutualAttentionUNetBlock(nn.Module):
         disable_middle_self_attn=False,
         use_linear_in_transformer=False,
         shared_kv=False,
-        return_kv=True
+        return_kv=True,
+        use_location_resblock=False
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -1246,6 +1286,14 @@ class MutualAttentionUNetBlock(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
+                    ) if not use_location_resblock else ResBlockLocationAware(
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=mult * model_channels,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
                     )
                 ]
                 ch = mult * model_channels
@@ -1283,7 +1331,7 @@ class MutualAttentionUNetBlock(nn.Module):
                 out_ch = ch
                 self.input_blocks.append(
                     SharedTimestepEmbedSequential(
-                        ResBlock(
+                        (ResBlock(
                             ch,
                             time_embed_dim,
                             dropout,
@@ -1292,7 +1340,16 @@ class MutualAttentionUNetBlock(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             down=True,
-                        )
+                        ) if not use_location_resblock else ResBlockLocationAware(
+                            ch,
+                            time_embed_dim,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            use_scale_shift_norm=use_scale_shift_norm,
+                            down=True
+                        ))
                         if resblock_updown
                         else Downsample(
                             ch, conv_resample, dims=dims, out_channels=out_ch
@@ -1304,7 +1361,6 @@ class MutualAttentionUNetBlock(nn.Module):
                 ds *= 2
                 self._feature_size += ch
 
-        # self.input_blocks = nn.ModuleList(self.input_blocks)
         if num_head_channels == -1:
             dim_head = ch // num_heads
         else:
@@ -1315,6 +1371,13 @@ class MutualAttentionUNetBlock(nn.Module):
             dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
         self.middle_block = SharedTimestepEmbedSequential(
             ResBlock(
+                ch,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ) if not use_location_resblock else ResBlockLocationAware(
                 ch,
                 time_embed_dim,
                 dropout,
@@ -1339,6 +1402,13 @@ class MutualAttentionUNetBlock(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
+            ) if not use_location_resblock else ResBlockLocationAware(
+                ch,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
             ),
         )
         self._feature_size += ch
@@ -1349,6 +1419,14 @@ class MutualAttentionUNetBlock(nn.Module):
                 ich = input_block_chans.pop()
                 layers = [
                     ResBlock(
+                        ch + ich,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=model_channels * mult,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    ) if not use_location_resblock else ResBlockLocationAware(
                         ch + ich,
                         time_embed_dim,
                         dropout,
@@ -1388,7 +1466,7 @@ class MutualAttentionUNetBlock(nn.Module):
                 if level and i == self.num_res_blocks[level]:
                     out_ch = ch
                     layers.append(
-                        ResBlock(
+                        (ResBlock(
                             ch,
                             time_embed_dim,
                             dropout,
@@ -1397,7 +1475,16 @@ class MutualAttentionUNetBlock(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             up=True,
-                        )
+                        ) if not use_location_resblock else ResBlockLocationAware(
+                            ch,
+                            time_embed_dim,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            use_scale_shift_norm=use_scale_shift_norm,
+                            up=True
+                        ))
                         if resblock_updown
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
@@ -1405,8 +1492,6 @@ class MutualAttentionUNetBlock(nn.Module):
                 self.output_blocks.append(SharedTimestepEmbedSequential(*layers))
                 self._feature_size += ch
         
-        # self.output_blocks = nn.ModuleList(self.output_blocks)
-
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
@@ -1535,7 +1620,8 @@ class MutualAttentionUNetModel(nn.Module):
             disable_middle_self_attn=disable_middle_self_attn,
             use_linear_in_transformer=use_linear_in_transformer,
             shared_kv=True,
-            return_kv=False
+            return_kv=False,
+            use_location_resblock=False
         )
         self.unet_reference = MutualAttentionUNetBlock(
             image_size=image_size,
@@ -1567,84 +1653,48 @@ class MutualAttentionUNetModel(nn.Module):
             disable_middle_self_attn=disable_middle_self_attn,
             use_linear_in_transformer=use_linear_in_transformer,
             shared_kv=False,
-            return_kv=True
+            return_kv=True,
+            use_location_resblock=True
         )
 
-    def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, y=None,**kwargs):
+        loc_embed_dim = model_channels * 4
+        self.loc_embed = nn.Sequential(
+            linear(3, loc_embed_dim),
+            nn.SiLU(),
+            linear(loc_embed_dim, loc_embed_dim),
+        )
+
+    def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, y=None,**kwargs):
         t_emb = timestep_embedding(timesteps, self.unet_target.model_channels, repeat_only=False)
         emb_t = self.unet_target.time_embed(t_emb)
         emb_r = self.unet_reference.time_embed(t_emb)
+
+        if location is not None:
+            emb_loc = self.loc_embed(location)
+            emb_r = th.cat([emb_r, emb_loc], dim=1)
 
         hs_t, hs_r = [], []
         h_t, h_r = x_t.type(self.unet_target.dtype), x_r.type(self.unet_reference.dtype)
 
         k_r, v_r = None, None
         for m_t, m_r in zip(self.unet_target.input_blocks, self.unet_reference.input_blocks):
-            # if isinstance(m_t, TimestepBlock) and isinstance(m_r, TimestepBlock):
-            #     h_t = m_t(h_t, emb_t)
-            #     h_r = m_r(h_r, emb_r)
-            # elif isinstance(m_r, SharedSpatialTransformer) and isinstance(m_t, SharedSpatialTransformer):
-            #     h_r, k_r, v_r = m_r(h_r, context=context_r)
-            #     h_t = m_t(h_t, k_r, v_r, context=context_t)
-            # elif isinstance(m_r, SharedAttentionBlock) and isinstance(m_t, SharedSpatialTransformer):
-            #     h_r, k_r, v_r = m_r(h_r)
-            #     h_t = m_t(h_t, k_r, v_r, context=context_t)
-            # else:
-            #     h_t = m_t(h_t)
-            #     h_r = m_r(h_r)
             h_r = m_r(h_r, emb_r, context=context_r)
             if isinstance(h_r, tuple):
                 h_r, k_r, v_r = h_r
             h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             hs_t.append(h_t)
             hs_r.append(h_r)
-            # if k_r is None and v_r is None:
-            #     print("None")
-            # else:
-            #     print(k_r.shape, v_r.shape)
-        
-        # for m_t, m_r in zip(self.unet_target.middle_block, self.unet_reference.middle_block):
-        #     if isinstance(m_t, TimestepBlock) and isinstance(m_r, TimestepBlock):
-        #         h_t = m_t(h_t, emb_t)
-        #         h_r = m_r(h_r, emb_r)
-        #     elif isinstance(m_r, SharedSpatialTransformer) and isinstance(m_t, SharedSpatialTransformer):
-        #         h_r, k_r, v_r = m_r(h_r, context=context_r)
-        #         h_t = m_t(h_t, k_r, v_r, context=context_t)
-        #     elif isinstance(m_r, SharedAttentionBlock) and isinstance(m_t, SharedSpatialTransformer):
-        #         h_r, k_r, v_r = m_r(h_r)
-        #         h_t = m_t(h_t, k_r, v_r, context=context_t)
-        #     else:
-        #         h_t = m_t(h_t)
-        #         h_r = m_r(h_r)
+            
         h_r = self.unet_reference.middle_block(h_r, emb_r, context=context_r)
         if isinstance(h_r, tuple):
             h_r, k_r, v_r = h_r
         h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
         
-        # print([h.shape for h in hs_r])
         for m_t, m_r in zip(self.unet_target.output_blocks, self.unet_reference.output_blocks):
-            # print(m_t.named_modules)
-            # if isinstance(m_t, TimestepBlock) and isinstance(m_r, TimestepBlock):
-            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t)
-            #     h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r)
-            # elif isinstance(m_r, SharedSpatialTransformer) and isinstance(m_t, SharedSpatialTransformer):
-            #     h_r, k_r, v_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), context=context_r)
-            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), k_r, v_r, context=context_t)
-            # elif isinstance(m_r, SharedAttentionBlock) and isinstance(m_t, SharedSpatialTransformer):
-            #     h_r, k_r, v_r = m_r(th.cat([h_r, hs_r.pop()], dim=1))
-            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), context=context_t)
-            # else:
-            #     h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1))
-            #     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1))
             h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r, context=context_r)
             if isinstance(h_r, tuple):
                 h_r, k_r, v_r = h_r
             h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
-
-            # if k_r is None and v_r is None:
-            #     print("None")
-            # else:
-            #     print(k_r.shape, v_r.shape)
 
         del k_r, v_r
         h_r, h_t = h_r.type(x_r.dtype), h_t.type(x_t.dtype)

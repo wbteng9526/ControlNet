@@ -1870,38 +1870,45 @@ class MutualAttentionLDM(LatentDiffusion):
         if bs is not None:
             x_r = x_r[:bs]
         x_r = x_r.to(self.device)
+
+        l_r = None
+        if self.mutual_cond_stage_key is not None:
+            l_r = batch[self.mutual_cond_stage_key]
+            if bs is not None:
+                l_r = l_r[:bs]
+            l_r = l_r.to(self.device)
         encoder_posterior = self.encode_first_stage(x_r)
         x_r = self.get_first_stage_encoding(encoder_posterior).detach()
         # x_r, c_r = super().get_input(batch, self.mutual_key, cond_key=self.first_stage_key, *args, **kwargs) # TODO change to other conditions
         # c_r = None # TODO add camera delta R and delta T like zero-123
-        return x_t, x_r, dict(c_t_crossattn=[c_t])#, dict(c_r_crossattn=[c_r])
+        return x_t, x_r, dict(c_t_crossattn=[c_t]), l_r#, dict(c_r_crossattn=[c_r])
     
     def shared_step(self, batch, *args, **kwargs):
-        x_t, x_r, c_t = self.get_input(batch, *args, *kwargs)
-        loss = self(x_t, x_r, c_t)
+        x_t, x_r, c_t, l_r = self.get_input(batch, *args, *kwargs)
+        loss = self(x_t, x_r, c_t, l_r)
         return loss
     
-    def forward(self, x_t, x_r, c_t, *args, **kwargs):
+    def forward(self, x_t, x_r, c_t, l_r, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x_t.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c_t is not None
             if self.cond_stage_trainable:
                 c_t = self.get_learned_conditioning(c_t)
-        return self.p_losses(x_t, x_r, c_t, t, *args, **kwargs)
+        return self.p_losses(x_t, x_r, c_t, t, l_r, *args, **kwargs)
     
-    def apply_model(self, x_t_noisy, x_r, t, cond_t, return_ids=False):
+    def apply_model(self, x_t_noisy, x_r, t, cond_t, l_r, return_ids=False):
         assert isinstance(cond_t, dict)
-        x_recon = self.model(x_t_noisy, x_r, t, **cond_t)
+        x_recon = self.model(x_t_noisy, x_r, t, **cond_t, location=l_r)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
         else:
             return x_recon
     
-    def p_losses(self, x_t_start, x_r, cond_t, t, noise=None):
+    def p_losses(self, x_t_start, x_r, cond_t, t, l_r, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_t_start))
         x_t_noisy = self.q_sample(x_start=x_t_start, t=t, noise=noise)
-        model_output = self.apply_model(x_t_noisy, x_r, t, cond_t)
+        model_output = self.apply_model(x_t_noisy, x_r, t, cond_t, l_r)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1935,10 +1942,10 @@ class MutualAttentionLDM(LatentDiffusion):
 
         return loss, loss_dict
     
-    def p_mean_variance(self, x_t, x_r, c_t, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
+    def p_mean_variance(self, x_t, x_r, c_t, t, l_r, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
         t_in = t
-        model_out = self.apply_model(x_t, x_r, t_in, c_t, return_ids=return_codebook_ids)
+        model_out = self.apply_model(x_t, x_r, t_in, c_t, l_r, return_ids=return_codebook_ids)
 
         if score_corrector is not None:
             assert self.parameterization == "eps"
@@ -1967,11 +1974,11 @@ class MutualAttentionLDM(LatentDiffusion):
             return model_mean, posterior_variance, posterior_log_variance
     
     @torch.no_grad()
-    def p_sample(self, x_t, x_r, c_t, t, clip_denoised=False, repeat_noise=False,
+    def p_sample(self, x_t, x_r, c_t, t, l_r, clip_denoised=False, repeat_noise=False,
                  return_codebook_ids=False, quantize_denoised=False, return_x0=False,
                  temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None):
         b, *_, device = *x_t.shape, x_t.device
-        outputs = self.p_mean_variance(x_t=x_t, x_r=x_r, c_t=c_t, t=t, clip_denoised=clip_denoised,
+        outputs = self.p_mean_variance(x_t=x_t, x_r=x_r, c_t=c_t, t=t, l_r=l_r, clip_denoised=clip_denoised,
                                        return_codebook_ids=return_codebook_ids,
                                        quantize_denoised=quantize_denoised,
                                        return_x0=return_x0,
@@ -1998,7 +2005,7 @@ class MutualAttentionLDM(LatentDiffusion):
             return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
     
     @torch.no_grad()
-    def p_sample_loop(self, cond, reference, shape, return_intermediates=False,
+    def p_sample_loop(self, cond, reference, reference_location, shape, return_intermediates=False,
                       x_T=None, verbose=True, callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, start_T=None,
                       log_every_t=None):
@@ -2032,7 +2039,7 @@ class MutualAttentionLDM(LatentDiffusion):
                 tc = self.cond_ids[ts].to(cond.device)
                 cond = self.q_sample(x_start=cond, t=tc, noise=torch.randn_like(cond))
 
-            img = self.p_sample(img, reference, cond, ts,
+            img = self.p_sample(img, reference, cond, ts, reference_location,
                                 clip_denoised=self.clip_denoised,
                                 quantize_denoised=quantize_denoised)
             if mask is not None:
@@ -2049,7 +2056,7 @@ class MutualAttentionLDM(LatentDiffusion):
         return img
     
     @torch.no_grad()
-    def sample(self, cond, reference, batch_size=16, return_intermediates=False, x_T=None,
+    def sample(self, cond, reference, reference_location, batch_size=16, return_intermediates=False, x_T=None,
                verbose=True, timesteps=None, quantize_denoised=False,
                mask=None, x0=None, shape=None, **kwargs):
         if shape is None:
@@ -2062,13 +2069,14 @@ class MutualAttentionLDM(LatentDiffusion):
                 cond = [c[:batch_size] for c in cond] if isinstance(cond, list) else cond[:batch_size]
         return self.p_sample_loop(cond,
                                   reference,
+                                  reference_location,
                                   shape,
                                   return_intermediates=return_intermediates, x_T=x_T,
                                   verbose=verbose, timesteps=timesteps, quantize_denoised=quantize_denoised,
                                   mask=mask, x0=x0)
 
     @torch.no_grad()
-    def sample_log(self, cond, reference, batch_size, ddim, ddim_steps, **kwargs):
+    def sample_log(self, cond, reference, reference_location, batch_size, ddim, ddim_steps, **kwargs):
         if ddim:
             ddim_sampler = DDIMSampler(self)
             shape = (self.channels, self.image_size, self.image_size)
@@ -2076,7 +2084,7 @@ class MutualAttentionLDM(LatentDiffusion):
                                                          shape, cond, verbose=False, **kwargs)
 
         else:
-            samples, intermediates = self.sample(cond=cond, reference=reference, batch_size=batch_size,
+            samples, intermediates = self.sample(cond=cond, reference=reference, reference_location=reference_location, batch_size=batch_size,
                                                  return_intermediates=True, **kwargs)
 
         return samples, intermediates
@@ -2091,7 +2099,7 @@ class MutualAttentionLDM(LatentDiffusion):
         use_ddim = False #ddim_steps is not None
 
         log = dict()
-        z_t, z_r, c_t = self.get_input(batch, bs=N)
+        z_t, z_r, c_t, l_r = self.get_input(batch, bs=N)
         c_t = c_t["c_t_crossattn"][0][:N]
         N = min(z_t.shape[0], N)
         n_row = min(z_t.shape[0], n_row)
@@ -2126,7 +2134,7 @@ class MutualAttentionLDM(LatentDiffusion):
         
         if sample:
             with ema_scope("Sampling"):
-                samples, z_denoise_row = self.sample_log(cond={"c_t_crossattn": [c_t]}, reference=z_r, batch_size=N, ddim=use_ddim,
+                samples, z_denoise_row = self.sample_log(cond={"c_t_crossattn": [c_t]}, reference=z_r, reference_location=l_r, batch_size=N, ddim=use_ddim,
                                                          ddim_steps=ddim_steps, eta=ddim_eta)
             x_samples = self.decode_first_stage(samples)
             log['samples'] = x_samples
@@ -2138,7 +2146,7 @@ class MutualAttentionLDM(LatentDiffusion):
                     self.first_stage_model, IdentityFirstStage):
                 # also display when quantizing x0 while sampling
                 with ema_scope("Plotting Quantized Denoised"):
-                    samples, z_denoise_row = self.sample_log(cond={"c_t_crossattn": [c_t]}, reference=z_r, batch_size=N, ddim=use_ddim,
+                    samples, z_denoise_row = self.sample_log(cond={"c_t_crossattn": [c_t]}, reference=z_r, reference_location=l_r, batch_size=N, ddim=use_ddim,
                                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                                              quantize_denoised=True)
                     # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,

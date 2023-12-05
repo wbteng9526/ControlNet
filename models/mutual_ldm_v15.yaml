@@ -9,7 +9,7 @@ model:
     first_stage_key: "jpg"
     cond_stage_key: "cond_jpg"
     mutual_key: "ref_jpg"
-    mutual_cond_stage_key: "txt"
+    mutual_cond_stage_key: "loc"
     image_size: 64
     channels: 4
     cond_stage_trainable: false
