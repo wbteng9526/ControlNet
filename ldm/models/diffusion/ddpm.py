@@ -1359,7 +1359,7 @@ class MutualDiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm', 'hybrid-adm', 'crossattn-adm']
 
-    def forward(self, x_t, x_r, t, c_t_concat: list = None, c_t_crossattn: list = None, c_t_adm=None, c_r_concat: list = None, c_r_crossattn: list = None, c_r_adm=None):
+    def forward(self, x_t, x_r, t, c_t_concat: list = None, c_t_crossattn: list = None, c_t_adm=None, c_r_concat: list = None, c_r_crossattn: list = None, c_r_adm=None, location=None):
         if self.conditioning_key is None:
             out = self.diffusion_model(x_t, x_r, t)
         elif self.conditioning_key == 'concat':
@@ -1379,7 +1379,7 @@ class MutualDiffusionWrapper(pl.LightningModule):
             else:
                 cc_t = c_t_crossattn
                 cc_r = c_r_crossattn
-            out = self.diffusion_model(x_t, x_r, t, context_t=cc_t)
+            out = self.diffusion_model(x_t, x_r, t, context_t=cc_t, location=location)
         elif self.conditioning_key == 'hybrid':
             xc_t = torch.cat([x_t] + c_t_concat, dim=1)
             xc_r = torch.cat([x_r] + c_r_concat, dim=1)

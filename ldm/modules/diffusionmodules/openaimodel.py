@@ -350,10 +350,12 @@ class ResBlockLocationAware(ResBlock):
             h = self.in_layers(x)
         
         time_emb, loc_emb = th.chunk(emb, chunks=2, dim=1)
-        time_emb_out = self.time_emb_layers(time_emb).type(h.dtype)
+        time_emb_out = self.emb_layers(time_emb).type(h.dtype)
         loc_emb_out = self.loc_emb_layers(loc_emb).type(h.dtype)
         while len(time_emb_out.shape) < len(h.shape):
             time_emb_out = time_emb_out[..., None]
+        while len(loc_emb_out.shape) < len(h.shape):
+            loc_emb_out = loc_emb_out[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = th.chunk(time_emb_out, 2, dim=1)

@@ -48,7 +48,7 @@ class MyMutualDataset(Dataset):
     def __init__(self):
         self.data = []
 
-        self.data_dir = '/home/wteng/data/sequence/training/'
+        self.data_dir = '/home/wteng/data/sequence_all/training/'
         with open(os.path.join(self.data_dir, 'prompts.json'), 'rt') as f:
             for line in f:
                 self.data.append(json.loads(line))
@@ -104,26 +104,28 @@ class MyMutualDataset(Dataset):
 
         ref_img = (ref_img.astype(np.float32) / 127.5) - 1.0
         
-        # source_camfile = self.data_dir + source_seq_id + "/target/camera/" + source_frame_id + ".json"
-        # with open(source_camfile, 'r') as f:
-        #     source_cam = json.loads(f)
+        source_camfile = self.data_dir + source_seq_id + "/target/camera/" + source_frame_id + ".json"
+        with open(source_camfile, 'r') as f:
+            source_cam = json.load(f)
         
-        # source_ext = np.array(source_cam['transform_matrix'])
-        # source_center = source_ext[:3, 3]
+        source_ext = np.array(source_cam['transform_matrix'])
+        source_center = source_ext[:3, 3]
 
-        # ref_camfile = source_seq_id + '/target/camera/frame_' + f"{ref_id:06d}.json"
-        # with open(ref_camfile, 'r') as f:
-        #     ref_cam = json.loads(f)
+        ref_camfile = self.data_dir + source_seq_id + '/target/camera/frame_' + f"{ref_id:06d}.json"
+        with open(ref_camfile, 'r') as f:
+            ref_cam = json.load(f)
         
-        # ref_ext = np.array(ref_cam['transform_matrix'])
-        # ref_center = ref_ext[:3, 3]
+        ref_ext = np.array(ref_cam['transform_matrix'])
+        ref_center = ref_ext[:3, 3]
+
+        dist = (ref_center - source_center).astype(np.float32)
 
         # forward = "forward" if ref_center[0] - source_center[0] >= 0 else "backward"
         # dis = np.sqrt(np.sum(ref_center - source_center) ** 2)
 
         # prompt = f"a realistic street view image with the same scene as the target image but only {dis} meters {forward} away from the target"
 
-        return dict(jpg=target_img, txt=prompt, cond_jpg=source_img, ref_jpg=ref_img)
+        return dict(jpg=target_img, loc=dist, cond_jpg=source_img, ref_jpg=ref_img)
 
 
 
