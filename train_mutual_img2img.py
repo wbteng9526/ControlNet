@@ -10,6 +10,7 @@ from cldm.model import create_model, load_state_dict
 if __name__ == "__main__":
     # Configs
     resume_path = None
+    single_model_path = './models/single_epoch75.ckpt'
     first_stage_path = './models/kl_f8.ckpt'
     cond_stage_path = './models/kl_f8.ckpt'
     batch_size = 4
@@ -26,13 +27,23 @@ if __name__ == "__main__":
     else:
         model.first_stage_model.load_state_dict(load_state_dict(first_stage_path, location='cpu'))
         model.cond_stage_model.load_state_dict(load_state_dict(cond_stage_path, location='cpu'))
+        single_model_state_dict = load_state_dict(single_model_path, location='cpu')
+
+        adapted_dict = {}
+        for key in single_model_state_dict.keys():
+            if "diffusion_model" in key:
+                adapted_key = key.replace("model.diffusion_model.", "")
+                if adapted_key in model.model.diffusion_model.unet_target.state_dict().keys():
+                    adapted_dict[adapted_key] = single_model_state_dict[key]
+
+        model.model.diffusion_model.unet_target.load_state_dict(adapted_dict)
     model.learning_rate = learning_rate
 
     # Misc
     dataset = MyMutualDataset()
     dataloader = DataLoader(dataset, num_workers=0, batch_size=batch_size, shuffle=True)
     logger = ImageLogger(batch_frequency=logger_freq)
-    trainer = pl.Trainer(gpus=1, precision=32, callbacks=[logger])
+    trainer = pl.Trainer(gpus=2, precision=32, callbacks=[logger])
 
 
     # Train!

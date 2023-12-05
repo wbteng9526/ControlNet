@@ -125,13 +125,14 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.gpu_autocast_kwargs = {"enabled": torch.is_autocast_enabled(),
                                    "dtype": torch.get_autocast_gpu_dtype(),
                                    "cache_enabled": torch.is_autocast_cache_enabled()}
+        # print([x.__name__ for x in ctx.input_tensors if x is None])
         with torch.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
         return output_tensors
 
     @staticmethod
     def backward(ctx, *output_grads):
-        print([x.shape for x in ctx.inpu_tensors if x is not None])
+        # print([x.shape for x in ctx.input_tensors if x is not None])
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
         with torch.enable_grad(), \
                 torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs):

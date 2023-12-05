@@ -1372,14 +1372,14 @@ class MutualDiffusionWrapper(pl.LightningModule):
                     cc_t = torch.cat(c_t_crossattn, 1)
                 else:
                     cc_t = c_t_crossattn[0]
-                if c_r_crossattn[0] is not None:
-                    cc_r = torch.cat(c_r_crossattn, 1)
-                else:
-                    cc_r = c_r_crossattn[0]
+                # if c_r_crossattn[0] is not None:
+                #     cc_r = torch.cat(c_r_crossattn, 1)
+                # else:
+                #     cc_r = c_r_crossattn[0]
             else:
                 cc_t = c_t_crossattn
                 cc_r = c_r_crossattn
-            out = self.diffusion_model(x_t, x_r, t, context_t=cc_t, context_r=cc_r)
+            out = self.diffusion_model(x_t, x_r, t, context_t=cc_t)
         elif self.conditioning_key == 'hybrid':
             xc_t = torch.cat([x_t] + c_t_concat, dim=1)
             xc_r = torch.cat([x_r] + c_r_concat, dim=1)
@@ -1863,39 +1863,45 @@ class MutualAttentionLDM(LatentDiffusion):
         self.mutual_cond_stage_key = mutual_cond_stage_key
 
     @torch.no_grad()
-    def get_input(self, batch, *args, **kwargs):
+    def get_input(self, batch, bs=None, *args, **kwargs):
         x_t, c_t = super().get_input(batch, self.first_stage_key, *args, **kwargs)
-        x_r, c_r = super().get_input(batch, self.mutual_key, cond_key=self.first_stage_key, *args, **kwargs) # TODO change to other conditions
-        c_r = None # TODO add camera delta R and delta T like zero-123
-        return x_t, x_r, dict(c_t_crossattn=[c_t]), dict(c_r_crossattn=[c_r])
+        x_r = batch[self.mutual_key]
+        x_r = rearrange(x_r, 'b h w c -> b c h w')
+        if bs is not None:
+            x_r = x_r[:bs]
+        x_r = x_r.to(self.device)
+        encoder_posterior = self.encode_first_stage(x_r)
+        x_r = self.get_first_stage_encoding(encoder_posterior).detach()
+        # x_r, c_r = super().get_input(batch, self.mutual_key, cond_key=self.first_stage_key, *args, **kwargs) # TODO change to other conditions
+        # c_r = None # TODO add camera delta R and delta T like zero-123
+        return x_t, x_r, dict(c_t_crossattn=[c_t])#, dict(c_r_crossattn=[c_r])
     
     def shared_step(self, batch, *args, **kwargs):
-        x_t, x_r, c_t, c_r = self.get_input(batch, *args, *kwargs)
-        loss = self(x_t, x_r, c_t, c_r)
+        x_t, x_r, c_t = self.get_input(batch, *args, *kwargs)
+        loss = self(x_t, x_r, c_t)
         return loss
     
-    def forward(self, x_t, x_r, c_t, c_r, *args, **kwargs):
+    def forward(self, x_t, x_r, c_t, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x_t.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c_t is not None
             if self.cond_stage_trainable:
                 c_t = self.get_learned_conditioning(c_t)
-        return self.p_losses(x_t, x_r, c_t, c_r, t, *args, **kwargs)
+        return self.p_losses(x_t, x_r, c_t, t, *args, **kwargs)
     
-    def apply_model(self, x_t_noisy, x_r, t, cond_t, cond_r, return_ids=False):
+    def apply_model(self, x_t_noisy, x_r, t, cond_t, return_ids=False):
         assert isinstance(cond_t, dict)
-        assert isinstance(cond_r, dict)
-        x_recon = self.model(x_t_noisy, x_r, t, **cond_t, **cond_r)
+        x_recon = self.model(x_t_noisy, x_r, t, **cond_t)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
         else:
             return x_recon
     
-    def p_losses(self, x_t_start, x_r, cond_t, cond_r, t, noise=None):
+    def p_losses(self, x_t_start, x_r, cond_t, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_t_start))
         x_t_noisy = self.q_sample(x_start=x_t_start, t=t, noise=noise)
-        model_output = self.apply_model(x_t_noisy, x_r, t, cond_t, cond_r)
+        model_output = self.apply_model(x_t_noisy, x_r, t, cond_t)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1929,10 +1935,10 @@ class MutualAttentionLDM(LatentDiffusion):
 
         return loss, loss_dict
     
-    def p_mean_variance(self, x_t, x_r, c_t, c_r, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
+    def p_mean_variance(self, x_t, x_r, c_t, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
         t_in = t
-        model_out = self.apply_model(x_t, x_r, t_in, c_t, c_r, return_ids=return_codebook_ids)
+        model_out = self.apply_model(x_t, x_r, t_in, c_t, return_ids=return_codebook_ids)
 
         if score_corrector is not None:
             assert self.parameterization == "eps"
@@ -1961,13 +1967,13 @@ class MutualAttentionLDM(LatentDiffusion):
             return model_mean, posterior_variance, posterior_log_variance
     
     @torch.no_grad()
-    def p_sample(self, x_t, x_r, c_t, c_r, t, clip_denoised=False, repeat_noise=False,
-                 return_codebook_ids=False, quantized_denoised=False, return_x0=False,
+    def p_sample(self, x_t, x_r, c_t, t, clip_denoised=False, repeat_noise=False,
+                 return_codebook_ids=False, quantize_denoised=False, return_x0=False,
                  temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None):
         b, *_, device = *x_t.shape, x_t.device
-        outputs = self.p_mean_variance(x_t=x_t, x_r=x_r, c_t=c_t, c_r=c_r, t=t, clip_denoised=clip_denoised,
+        outputs = self.p_mean_variance(x_t=x_t, x_r=x_r, c_t=c_t, t=t, clip_denoised=clip_denoised,
                                        return_codebook_ids=return_codebook_ids,
-                                       quantize_denoised=quantized_denoised,
+                                       quantize_denoised=quantize_denoised,
                                        return_x0=return_x0,
                                        score_corrector=score_corrector, corrector_kwargs=corrector_kwargs)
         if return_codebook_ids:
@@ -1978,11 +1984,11 @@ class MutualAttentionLDM(LatentDiffusion):
         else:
             model_mean, _, model_log_variance = outputs
 
-        noise = noise_like(x.shape, device, repeat_noise) * temperature
+        noise = noise_like(x_t.shape, device, repeat_noise) * temperature
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         # no noise when t == 0
-        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x_t.shape) - 1)))
 
         if return_codebook_ids:
             return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise, logits.argmax(dim=1)
@@ -1992,16 +1998,101 @@ class MutualAttentionLDM(LatentDiffusion):
             return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
     
     @torch.no_grad()
+    def p_sample_loop(self, cond, reference, shape, return_intermediates=False,
+                      x_T=None, verbose=True, callback=None, timesteps=None, quantize_denoised=False,
+                      mask=None, x0=None, img_callback=None, start_T=None,
+                      log_every_t=None):
+
+        if not log_every_t:
+            log_every_t = self.log_every_t
+        device = self.betas.device
+        b = shape[0]
+        if x_T is None:
+            img = torch.randn(shape, device=device)
+        else:
+            img = x_T
+
+        intermediates = [img]
+        if timesteps is None:
+            timesteps = self.num_timesteps
+
+        if start_T is not None:
+            timesteps = min(timesteps, start_T)
+        iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps) if verbose else reversed(
+            range(0, timesteps))
+
+        if mask is not None:
+            assert x0 is not None
+            assert x0.shape[2:3] == mask.shape[2:3]  # spatial size has to match
+
+        for i in iterator:
+            ts = torch.full((b,), i, device=device, dtype=torch.long)
+            if self.shorten_cond_schedule:
+                assert self.model.conditioning_key != 'hybrid'
+                tc = self.cond_ids[ts].to(cond.device)
+                cond = self.q_sample(x_start=cond, t=tc, noise=torch.randn_like(cond))
+
+            img = self.p_sample(img, reference, cond, ts,
+                                clip_denoised=self.clip_denoised,
+                                quantize_denoised=quantize_denoised)
+            if mask is not None:
+                img_orig = self.q_sample(x0, ts)
+                img = img_orig * mask + (1. - mask) * img
+
+            if i % log_every_t == 0 or i == timesteps - 1:
+                intermediates.append(img)
+            if callback: callback(i)
+            if img_callback: img_callback(img, i)
+
+        if return_intermediates:
+            return img, intermediates
+        return img
+    
+    @torch.no_grad()
+    def sample(self, cond, reference, batch_size=16, return_intermediates=False, x_T=None,
+               verbose=True, timesteps=None, quantize_denoised=False,
+               mask=None, x0=None, shape=None, **kwargs):
+        if shape is None:
+            shape = (batch_size, self.channels, self.image_size, self.image_size)
+        if cond is not None:
+            if isinstance(cond, dict):
+                cond = {key: cond[key][:batch_size] if not isinstance(cond[key], list) else
+                list(map(lambda x: x[:batch_size], cond[key])) for key in cond}
+            else:
+                cond = [c[:batch_size] for c in cond] if isinstance(cond, list) else cond[:batch_size]
+        return self.p_sample_loop(cond,
+                                  reference,
+                                  shape,
+                                  return_intermediates=return_intermediates, x_T=x_T,
+                                  verbose=verbose, timesteps=timesteps, quantize_denoised=quantize_denoised,
+                                  mask=mask, x0=x0)
+
+    @torch.no_grad()
+    def sample_log(self, cond, reference, batch_size, ddim, ddim_steps, **kwargs):
+        if ddim:
+            ddim_sampler = DDIMSampler(self)
+            shape = (self.channels, self.image_size, self.image_size)
+            samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size,
+                                                         shape, cond, verbose=False, **kwargs)
+
+        else:
+            samples, intermediates = self.sample(cond=cond, reference=reference, batch_size=batch_size,
+                                                 return_intermediates=True, **kwargs)
+
+        return samples, intermediates
+
+    @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=50, ddim_eta=0, return_keys=None, 
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True, 
                    plot_diffusion_rows=True, unconditional_guidance_scale=1, unconditional_guidance_label=None, 
                    use_ema_scope=True, 
                    **kwargs):
         ema_scope = self.ema_scope if use_ema_scope else nullcontext
-        use_ddim = ddim_steps is not None
+        use_ddim = False #ddim_steps is not None
 
         log = dict()
-        z_t, z_r, c_t, c_r = self.get_input(batch, bs=N)
+        z_t, z_r, c_t = self.get_input(batch, bs=N)
+        c_t = c_t["c_t_crossattn"][0][:N]
         N = min(z_t.shape[0], N)
         n_row = min(z_t.shape[0], n_row)
 
@@ -2016,26 +2107,26 @@ class MutualAttentionLDM(LatentDiffusion):
             if ismap(xc_t):
                 log["original_conditioning"] = xc_t
         
-        if plot_diffusion_rows:
-            diffusion_row = list()
-            z_start = z_t[:n_row]
-            for t in range(self.num_timesteps):
-                if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
-                    t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
-                    t = t.to(self.device).long()
-                    noise = torch.randn_like(z_start)
-                    z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
-                    diffusion_row.append(self.decode_first_stage(z_noisy))
+        # if plot_diffusion_rows:
+        #     diffusion_row = list()
+        #     z_start = z_t[:n_row]
+        #     for t in range(self.num_timesteps):
+        #         if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
+        #             t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
+        #             t = t.to(self.device).long()
+        #             noise = torch.randn_like(z_start)
+        #             z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
+        #             diffusion_row.append(self.decode_first_stage(z_noisy))
 
-            diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
-            diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
-            diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
-            diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
-            log["diffusion_row"] = diffusion_grid
+        #     diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
+        #     diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
+        #     diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
+        #     diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
+        #     log["diffusion_row"] = diffusion_grid
         
         if sample:
             with ema_scope("Sampling"):
-                samples, z_denoise_row = self.sample_log(cond=c_t, batch_size=N, ddim=use_ddim,
+                samples, z_denoise_row = self.sample_log(cond={"c_t_crossattn": [c_t]}, reference=z_r, batch_size=N, ddim=use_ddim,
                                                          ddim_steps=ddim_steps, eta=ddim_eta)
             x_samples = self.decode_first_stage(samples)
             log['samples'] = x_samples
@@ -2047,7 +2138,7 @@ class MutualAttentionLDM(LatentDiffusion):
                     self.first_stage_model, IdentityFirstStage):
                 # also display when quantizing x0 while sampling
                 with ema_scope("Plotting Quantized Denoised"):
-                    samples, z_denoise_row = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                    samples, z_denoise_row = self.sample_log(cond={"c_t_crossattn": [c_t]}, reference=z_r, batch_size=N, ddim=use_ddim,
                                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                                              quantize_denoised=True)
                     # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
@@ -2055,13 +2146,13 @@ class MutualAttentionLDM(LatentDiffusion):
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_x0_quantized"] = x_samples
         
-        if plot_progressive_rows:
-            with ema_scope("Plotting Progressives"):
-                img, progressives = self.progressive_denoising(c_t,
-                                                               shape=(self.channels, self.image_size, self.image_size),
-                                                               batch_size=N)
-            prog_row = self._get_denoise_row_from_list(progressives, desc="Progressive Generation")
-            log["progressive_row"] = prog_row
+        # if plot_progressive_rows:
+        #     with ema_scope("Plotting Progressives"):
+        #         img, progressives = self.progressive_denoising({"c_crossattn":c_t},
+        #                                                        shape=(self.channels, self.image_size, self.image_size),
+        #                                                        batch_size=N)
+        #     prog_row = self._get_denoise_row_from_list(progressives, desc="Progressive Generation")
+        #     log["progressive_row"] = prog_row
 
         if return_keys:
             if np.intersect1d(list(log.keys()), return_keys).shape[0] == 0:

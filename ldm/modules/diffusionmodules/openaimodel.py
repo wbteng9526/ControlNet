@@ -131,7 +131,7 @@ class SharedTimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 if isinstance(x, tuple):
                     x, k, v = x
             elif isinstance(layer, SharedAttentionBlock):
-                x = layer(x, shared_k, shared_v)
+                x = layer(x)
                 if isinstance(x, tuple):
                     x, k, v = x
             else:
@@ -462,18 +462,18 @@ class SharedAttentionBlock(nn.Module):
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
-    def forward(self, x, shared_k=None, shared_v=None):
-        return checkpoint(self._forward, (x, shared_k, shared_v), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+    def forward(self, x):
+        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
         #return pt_checkpoint(self._forward, x)  # pytorch
 
-    def _forward(self, x, shared_k=None, shared_v=None):
+    def _forward(self, x):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
-        if self.shared_kv:
-            h = self.attention(qkv, shared_k, shared_v)
-        else:
-            h, k, v = self.attention(qkv)
+        # if self.shared_kv:
+        #     h = self.attention(qkv, shared_k, shared_v)
+        # else:
+        h, k, v = self.attention(qkv)
         h = self.proj_out(h)
         if self.return_kv:
             return (x + h).reshape(b, c, *spatial), k, v
@@ -572,7 +572,7 @@ class SharedQKVAttentionLegacy(nn.Module):
         self.return_kv = return_kv
         self.shared_kv = shared_kv
     
-    def forward(self, qkv, shared_k=None, shared_v=None):
+    def forward(self, qkv):
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
@@ -580,21 +580,21 @@ class SharedQKVAttentionLegacy(nn.Module):
         # print(qkv.shape, k.shape)
         scale = 1 / math.sqrt(math.sqrt(ch))
 
-        if self.shared_kv:
-            assert shared_k is not None
-            weight = th.einsum(
-                "bct,bcs->bts", q * scale, th.cat([k, shared_k], dim=-2) * scale
-            )  # More stable with f16 than dividing afterwards
-        else:
-            weight = th.einsum(
-                "bct,bcs->bts", q * scale, k * scale
-            )  # More stable with f16 than dividing afterwards
+        # if self.shared_kv:
+        #     assert shared_k is not None
+        #     weight = th.einsum(
+        #         "bct,bcs->bts", q * scale, th.cat([k, shared_k], dim=-2) * scale
+        #     )  # More stable with f16 than dividing afterwards
+        # else:
+        weight = th.einsum(
+            "bct,bcs->bts", q * scale, k * scale
+        )  # More stable with f16 than dividing afterwards
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
 
-        if self.shared_kv:
-            a = th.einsum("bts,bcs->bct", weight, th.cat([v, shared_v], dim=-2))
-        else:
-            a = th.einsum("bts,bcs->bct", weight, v)
+        # if self.shared_kv:
+        #     a = th.einsum("bts,bcs->bct", weight, th.cat([v, shared_v], dim=-2))
+        # else:
+        a = th.einsum("bts,bcs->bct", weight, v)
         
         if self.return_kv:
             return a.reshape(bs, -1, length), k, v
@@ -679,7 +679,7 @@ class SharedQKVAttention(nn.Module):
         self.return_kv = return_kv
         self.shared_kv = shared_kv
 
-    def forward(self, qkv, shared_k=None, shared_v=None):
+    def forward(self, qkv):
         """
         Apply QKV attention.
         :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
@@ -691,24 +691,24 @@ class SharedQKVAttention(nn.Module):
         q, k, v = qkv.chunk(3, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
 
-        if self.shared_kv:
-            weight = th.einsum(
-                "bct,bcs->bts",
-                (q * scale).view(bs * self.n_heads, ch, length),
-                (th.cat([k, shared_k], dim=-2) * scale).view(bs * self.n_heads, ch, length),
-            )  # More stable with f16 than dividing afterwards
-        else:
-            weight = th.einsum(
-                "bct,bcs->bts",
-                (q * scale).view(bs * self.n_heads, ch, length),
-                (k * scale).view(bs * self.n_heads, ch, length),
-            )  # More stable with f16 than dividing afterwards
+        # if self.shared_kv:
+        #     weight = th.einsum(
+        #         "bct,bcs->bts",
+        #         (q * scale).view(bs * self.n_heads, ch, length),
+        #         (th.cat([k, shared_k], dim=-2) * scale).view(bs * self.n_heads, ch, length),
+        #     )  # More stable with f16 than dividing afterwards
+        # else:
+        weight = th.einsum(
+            "bct,bcs->bts",
+            (q * scale).view(bs * self.n_heads, ch, length),
+            (k * scale).view(bs * self.n_heads, ch, length),
+        )  # More stable with f16 than dividing afterwards
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
 
-        if self.shared_kv:
-            a = th.einsum("bts,bcs->bct", weight, th.cat([v, shared_v], dim=-2).reshape(bs * self.n_heads, ch, length))
-        else:
-            a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        # if self.shared_kv:
+        #     a = th.einsum("bts,bcs->bct", weight, th.cat([v, shared_v], dim=-2).reshape(bs * self.n_heads, ch, length))
+        # else:
+        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         
         if self.return_kv:
             return a.reshape(bs, -1, length), k, v
@@ -1598,6 +1598,10 @@ class MutualAttentionUNetModel(nn.Module):
             h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             hs_t.append(h_t)
             hs_r.append(h_r)
+            # if k_r is None and v_r is None:
+            #     print("None")
+            # else:
+            #     print(k_r.shape, v_r.shape)
         
         # for m_t, m_r in zip(self.unet_target.middle_block, self.unet_reference.middle_block):
         #     if isinstance(m_t, TimestepBlock) and isinstance(m_r, TimestepBlock):
@@ -1637,8 +1641,14 @@ class MutualAttentionUNetModel(nn.Module):
                 h_r, k_r, v_r = h_r
             h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
 
+            # if k_r is None and v_r is None:
+            #     print("None")
+            # else:
+            #     print(k_r.shape, v_r.shape)
 
+        del k_r, v_r
         h_r, h_t = h_r.type(x_r.dtype), h_t.type(x_t.dtype)
+
         if self.unet_target.predict_codebook_ids:
             return self.unet_target.id_predictor(h_t)
         else:

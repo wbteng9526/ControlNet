@@ -1,3 +1,3 @@
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=0
 
 python train_single_img2img.py
