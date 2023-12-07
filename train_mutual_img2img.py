@@ -13,7 +13,7 @@ if __name__ == "__main__":
     single_model_path = './models/single_epoch75.ckpt'
     first_stage_path = './models/kl_f8.ckpt'
     cond_stage_path = './models/kl_f8.ckpt'
-    batch_size = 4
+    batch_size = 3
     logger_freq = 2000
     learning_rate = 1e-5
     sd_locked = True
@@ -43,7 +43,7 @@ if __name__ == "__main__":
     dataset = MyMutualDataset()
     dataloader = DataLoader(dataset, num_workers=0, batch_size=batch_size, shuffle=True)
     logger = ImageLogger(batch_frequency=logger_freq)
-    trainer = pl.Trainer(gpus=2, precision=32, callbacks=[logger])
+    trainer = pl.Trainer(gpus=3, precision=32, callbacks=[logger])
 
 
     # Train!

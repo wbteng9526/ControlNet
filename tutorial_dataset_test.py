@@ -12,14 +12,15 @@ class MyDataset(Dataset):
         self.data = []
         self.seq_name = seq_name
 
-        self.data_dir = '/home/wteng/data/sequence_all/testing/'
+        self.data_dir = '/home/wteng/data/sequence/testing_seq/'
         with open(os.path.join(self.data_dir, 'prompts.json'), 'rt') as f:
             for line in f:
-                if line.split('/')[0] == self.seq_name:
+                elem = json.loads(line)
+                if elem['source'].split('/')[0] == self.seq_name:
                     self.data.append(json.loads(line))
         f.close()
 
-        self.camera_dir = self.data_dir + 'target/camera/'
+        self.camera_dir = self.data_dir + self.seq_name + '/target/camera/'
         camera_paths = [self.camera_dir + f for f in sorted(os.listdir(self.camera_dir))]
         cam_cs = []
         for path in camera_paths:
@@ -29,8 +30,12 @@ class MyDataset(Dataset):
             cam_ext = np.array(cam['transform_matrix'])
             cam_c = cam_ext[:3, 3]
             cam_cs.append(cam_c)
-        self.cam_dcs[1:] = [(cam_cs[i]- cam_cs[i-1]).astype(np.float32) for i in range(1, len(cam_cs))]
-        self.cam_dcs[0] = np.zeros_like(self.cam_dcs[0]).astype(np.float32)
+        self.cam_dcs = []
+        self.cam_dcs.append(np.zeros_like(cam_cs[0]).astype(np.float32))
+        for i in range(1, len(cam_cs)):
+            self.cam_dcs.append((cam_cs[i]- cam_cs[i-1]).astype(np.float32))
+        # self.cam_dcs[1:] = [(cam_cs[i]- cam_cs[i-1]).astype(np.float32) for i in range(1, len(cam_cs))]
+        # self.cam_dcs[0] = np.zeros_like(self.cam_dcs[0]).astype(np.float32)
 
     def __len__(self):
         return len(self.data)

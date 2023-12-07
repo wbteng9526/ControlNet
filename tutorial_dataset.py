@@ -107,6 +107,7 @@ class MyMutualDataset(Dataset):
         source_camfile = self.data_dir + source_seq_id + "/target/camera/" + source_frame_id + ".json"
         with open(source_camfile, 'r') as f:
             source_cam = json.load(f)
+        f.close()
         
         source_ext = np.array(source_cam['transform_matrix'])
         source_center = source_ext[:3, 3]
@@ -114,6 +115,7 @@ class MyMutualDataset(Dataset):
         ref_camfile = self.data_dir + source_seq_id + '/target/camera/frame_' + f"{ref_id:06d}.json"
         with open(ref_camfile, 'r') as f:
             ref_cam = json.load(f)
+        f.close()
         
         ref_ext = np.array(ref_cam['transform_matrix'])
         ref_center = ref_ext[:3, 3]
