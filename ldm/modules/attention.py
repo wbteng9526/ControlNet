@@ -604,8 +604,8 @@ class SharedSpatialTransformer(SpatialTransformer):
             ks, vs = [], []
         for i, block in enumerate(self.transformer_blocks):
             c = context[i]
-            if exists(c):
-                c = rearrange(c, 'b c h w -> b (h w) c').contiguous()
+            # if exists(c):
+            #     c = rearrange(c, 'b c h w -> b (h w) c').contiguous()
             if self.return_kv:
                 x, k, v = block(x)
                 ks.append(k)

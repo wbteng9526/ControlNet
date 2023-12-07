@@ -122,12 +122,7 @@ class MyMutualDataset(Dataset):
 
         dist = (ref_center - source_center).astype(np.float32)
 
-        # forward = "forward" if ref_center[0] - source_center[0] >= 0 else "backward"
-        # dis = np.sqrt(np.sum(ref_center - source_center) ** 2)
-
-        # prompt = f"a realistic street view image with the same scene as the target image but only {dis} meters {forward} away from the target"
-
-        return dict(jpg=target_img, loc=dist, cond_jpg=source_img, ref_jpg=ref_img)
+        return dict(jpg=target_img, loc=dist, cond_jpg=source_img, ref_jpg=ref_img, txt=prompt, hint=source_img)
 
 
 
