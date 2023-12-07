@@ -5,6 +5,7 @@ lightning_logs/
 image_log/
 models/*.ckpt
 models/*.py
+test/
 
 *.pth
 *.pt

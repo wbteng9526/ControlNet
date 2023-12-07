@@ -83,6 +83,7 @@ class MutualAttentionControlledLDM(LatentDiffusion):
         self.model = MutualDiffusionWrapper(kwargs['unet_config'], kwargs['conditioning_key'])
         self.mutual_key = mutual_key
         self.mutual_cond_stage_key = mutual_cond_stage_key
+        self.control_scales = [1.0] * 13
 
     @torch.no_grad()
     def get_input(self, batch, bs=None, *args, **kwargs):
@@ -109,7 +110,7 @@ class MutualAttentionControlledLDM(LatentDiffusion):
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
         
-        return x_t, x_r, dict(c_t_crossattn=[c_t], c_concat=[control]), l_r#, dict(c_r_crossattn=[c_r])
+        return x_t, x_r, dict(c_t_crossattn=[c_t], c_t_concat=[control]), l_r#, dict(c_r_crossattn=[c_r])
     
     def shared_step(self, batch, *args, **kwargs):
         x_t, x_r, c_t, l_r = self.get_input(batch, *args, *kwargs)
@@ -133,7 +134,7 @@ class MutualAttentionControlledLDM(LatentDiffusion):
         if cond_t['c_t_concat'] is None:
             eps = diffusion_model(x_t=x_t_noisy, x_r=x_r, timesteps=t, context_t=cond_t_txt, context_r=None, location=l_r, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_t_noisy, hint=torch.cat(cond_t['c_concat'], 1), timesteps=t, context=cond_t_txt)
+            control = self.control_model(x=x_t_noisy, hint=torch.cat(cond_t['c_t_concat'], 1), timesteps=t, context=cond_t_txt)
             control = [c * scale for c, scale in zip(control, self.control_scales)]
             eps = diffusion_model(x_t=x_t_noisy, x_r=x_r, timesteps=t, context_t=cond_t_txt, context_r=None, location=l_r, control=control, only_mid_control=self.only_mid_control)
         

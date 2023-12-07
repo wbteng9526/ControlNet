@@ -50,7 +50,7 @@ model:
         num_heads: 8
         use_spatial_transformer: True
         transformer_depth: 1
-        context1_dim: 4
+        context1_dim: 768
         context2_dim: 768
         use_checkpoint: True
         legacy: False

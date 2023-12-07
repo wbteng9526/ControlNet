@@ -559,8 +559,8 @@ class SpatialTransformer(nn.Module):
             x = self.proj_in(x)
         for i, block in enumerate(self.transformer_blocks):
             c = context[i]
-            if exists(c):
-                c = rearrange(c, 'b c h w -> b (h w) c').contiguous()
+            # if exists(c):
+            #     c = rearrange(c, 'b c h w -> b (h w) c').contiguous()
             x = block(x, context=c)
         if self.use_linear:
             x = self.proj_out(x)
