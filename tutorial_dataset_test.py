@@ -61,4 +61,4 @@ class MyDataset(Dataset):
         target_img = (target_img.astype(np.float32) / 127.5) - 1.0
 
         dist = self.cam_dcs[idx]
-        return dict(jpg=target_img, loc=dist, txt=prompt, cond_jpg=source_img)
+        return dict(jpg=target_img, loc=dist, txt=prompt, cond_jpg=source_img, hint=source_img)
