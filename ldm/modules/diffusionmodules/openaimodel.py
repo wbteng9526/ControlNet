@@ -1505,6 +1505,7 @@ class MutualAttentionUNetBlock(nn.Module):
             conv_nd(dims, model_channels, n_embed, 1),
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
+        self.return_kv = return_kv
 
     def convert_to_fp16(self):
         """
@@ -1534,7 +1535,7 @@ class MutualAttentionUNetBlock(nn.Module):
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
-        hs = []
+        hs, ks, vs = [], [], []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
@@ -1544,16 +1545,34 @@ class MutualAttentionUNetBlock(nn.Module):
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb, context)
+            if self.return_kv:
+                h, k, v = module(h, emb, context)
+                ks.append(k)
+                vs.append(v)
+            else:
+                h = module(h, emb, context)
             hs.append(h)
-        h = self.middle_block(h, emb, context)
+        if self.return_kv:
+            h, k, v = self.middle_block(h, emb, context)
+            ks.append(k)
+            vs.append(v)
+        else:
+            h = self.middle_block(h, emb, context)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
+            if self.return_kv:
+                h, k, v = module(h, emb, context)
+                ks.append(k)
+                vs.append(v)
             h = module(h, emb, context)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
+            if self.return_kv:
+                return self.id_predictor(h), ks, vs
             return self.id_predictor(h)
         else:
+            if self.return_kv:
+                return self.out(h), ks, vs
             return self.out(h)
 
 
@@ -1590,6 +1609,8 @@ class MutualAttentionUNetModel(nn.Module):
         num_attention_blocks=None,
         disable_middle_self_attn=False,
         use_linear_in_transformer=False,
+        omega_start=0.1,
+        omega_end=0.1
     ):
         super().__init__()
         self.unet_target = MutualAttentionUNetBlock(
@@ -1665,14 +1686,22 @@ class MutualAttentionUNetModel(nn.Module):
             nn.SiLU(),
             linear(loc_embed_dim, loc_embed_dim),
         )
+        self.omega_start = omega_start
+        self.omega_end = omega_end
 
-    def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, y=None,**kwargs):
+    def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, y=None, locs=None, ks_r=None, vs_r=None, **kwargs):
         t_emb = timestep_embedding(timesteps, self.unet_target.model_channels, repeat_only=False)
         emb_t = self.unet_target.time_embed(t_emb)
         emb_r = self.unet_reference.time_embed(t_emb)
 
         if location is not None:
             emb_loc = self.loc_embed(location)
+            if locs is not None:
+                assert isinstance(locs, list) and len(locs) == 2
+                emb_loc = (1. - self.omega_end - self.omega_start) * emb_loc + \
+                    self.omega_start * self.loc_embed(locs[0]) + \
+                    self.omega_end * self.loc_embed(locs[1])
+            
             emb_r = th.cat([emb_r, emb_loc], dim=1)
 
         hs_t, hs_r = [], []
@@ -1683,6 +1712,12 @@ class MutualAttentionUNetModel(nn.Module):
             h_r = m_r(h_r, emb_r, context=context_r)
             if isinstance(h_r, tuple):
                 h_r, k_r, v_r = h_r
+                if ks_r is not None and vs_r is not None:
+                    assert isinstance(ks_r, list) and len(ks_r) == 2
+                    assert isinstance(vs_r, list) and len(vs_r) == 2
+                    k_r = self.omega_start * ks_r[0] + self.omega_end * ks_r[1] + (1. - self.omega_end - self.omega_start) * k_r
+                    v_r = self.omega_start * vs_r[0] + self.omega_end * vs_r[1] + (1. - self.omega_end - self.omega_start) * v_r
+                    
             h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             hs_t.append(h_t)
             hs_r.append(h_r)

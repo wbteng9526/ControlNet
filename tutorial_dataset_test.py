@@ -30,12 +30,13 @@ class MyDataset(Dataset):
             cam_ext = np.array(cam['transform_matrix'])
             cam_c = cam_ext[:3, 3]
             cam_cs.append(cam_c)
-        self.cam_dcs = []
-        self.cam_dcs.append(np.zeros_like(cam_cs[0]).astype(np.float32))
-        for i in range(1, len(cam_cs)):
-            self.cam_dcs.append((cam_cs[i]- cam_cs[i-1]).astype(np.float32))
+        # self.cam_dcs = []
+        # self.cam_dcs.append(np.zeros_like(cam_cs[0]).astype(np.float32))
+        # for i in range(1, len(cam_cs)):
+        #     self.cam_dcs.append((cam_cs[i-1]- cam_cs[i]).astype(np.float32))
         # self.cam_dcs[1:] = [(cam_cs[i]- cam_cs[i-1]).astype(np.float32) for i in range(1, len(cam_cs))]
         # self.cam_dcs[0] = np.zeros_like(self.cam_dcs[0]).astype(np.float32)
+        self.cam_dcs = cam_cs
 
     def __len__(self):
         return len(self.data)

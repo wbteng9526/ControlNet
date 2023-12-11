@@ -24,7 +24,7 @@ from ldm.models.diffusion.ddim import DDIMSampler
 
 
 class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
-    def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, control=None, only_mid_control=False, **kwargs):
+    def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, control=None, locs=None, ks_r=None, vs_r=None, only_mid_control=False, **kwargs):
         hs_t, hs_r = [], []
         t_emb = timestep_embedding(timesteps, self.unet_target.model_channels, repeat_only=False)
         emb_t = self.unet_target.time_embed(t_emb)
@@ -32,9 +32,17 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
 
         if location is not None:
             emb_loc = self.loc_embed(location)
+            if locs is not None:
+                emb_loc = (1. - self.omega_end - self.omega_start) * emb_loc + \
+                    self.omega_start * self.loc_embed(locs[0]) + \
+                    self.omega_end * self.loc_embed(locs[1])
             emb_r = th.cat([emb_r, emb_loc], dim=1)
-
         
+        if ks_r is not None:
+            ks_s, ks_e = ks_r
+        if vs_r is not None:
+            vs_s, vs_e = vs_r
+
         h_t, h_r = x_t.type(self.unet_target.dtype), x_r.type(self.unet_reference.dtype)
 
         k_r, v_r = None, None
@@ -42,6 +50,9 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
             h_r = m_r(h_r, emb_r, context=context_r)
             if isinstance(h_r, tuple):
                 h_r, k_r, v_r = h_r
+                if ks_r is not None and vs_r is not None:
+                    k_r = self.omega_start * ks_s.pop(0) + self.omega_end * ks_e.pop(0) + (1. - self.omega_end - self.omega_start) * k_r
+                    v_r = self.omega_start * vs_s.pop(0) + self.omega_end * vs_e.pop(0) + (1. - self.omega_end - self.omega_start) * v_r
             h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             hs_t.append(h_t)
             hs_r.append(h_r)
@@ -49,6 +60,9 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
         h_r = self.unet_reference.middle_block(h_r, emb_r, context=context_r)
         if isinstance(h_r, tuple):
             h_r, k_r, v_r = h_r
+            if ks_r is not None and vs_r is not None:
+                k_r = self.omega_start * ks_s.pop(0) + self.omega_end * ks_e.pop(0) + (1. - self.omega_end - self.omega_start) * k_r
+                v_r = self.omega_start * vs_s.pop(0) + self.omega_end * vs_e.pop(0) + (1. - self.omega_end - self.omega_start) * v_r
         h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
 
         if control is not None:
@@ -58,6 +72,9 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
             h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r, context=context_r)
             if isinstance(h_r, tuple):
                 h_r, k_r, v_r = h_r
+                if ks_r is not None and vs_r is not None:
+                    k_r = self.omega_start * ks_s.pop(0) + self.omega_end * ks_e.pop(0) + (1. - self.omega_end - self.omega_start) * k_r
+                    v_r = self.omega_start * vs_s.pop(0) + self.omega_end * vs_e.pop(0) + (1. - self.omega_end - self.omega_start) * v_r
             if only_mid_control or control is None:
                 h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             else:
@@ -125,18 +142,18 @@ class MutualAttentionControlledLDM(LatentDiffusion):
                 c_t = self.get_learned_conditioning(c_t)
         return self.p_losses(x_t, x_r, c_t, t, l_r, *args, **kwargs)
     
-    def apply_model(self, x_t_noisy, x_r, t, cond_t, l_r, *args, **kwargs):
+    def apply_model(self, x_t_noisy, x_r, t, cond_t, l_r, locs=None, ks=None, vs=None, *args, **kwargs):
         assert isinstance(cond_t, dict)
         diffusion_model = self.model.diffusion_model
 
         cond_t_txt = torch.cat(cond_t['c_t_crossattn'], 1)
 
         if cond_t['c_t_concat'] is None:
-            eps = diffusion_model(x_t=x_t_noisy, x_r=x_r, timesteps=t, context_t=cond_t_txt, context_r=None, location=l_r, control=None, only_mid_control=self.only_mid_control)
+            eps = diffusion_model(x_t=x_t_noisy, x_r=x_r, timesteps=t, context_t=cond_t_txt, context_r=None, location=l_r, control=None, locs=locs, ks=ks, vs=vs, only_mid_control=self.only_mid_control)
         else:
             control = self.control_model(x=x_t_noisy, hint=torch.cat(cond_t['c_t_concat'], 1), timesteps=t, context=cond_t_txt)
             control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x_t=x_t_noisy, x_r=x_r, timesteps=t, context_t=cond_t_txt, context_r=None, location=l_r, control=control, only_mid_control=self.only_mid_control)
+            eps = diffusion_model(x_t=x_t_noisy, x_r=x_r, timesteps=t, context_t=cond_t_txt, context_r=None, location=l_r, control=control, locs=locs, ks=ks, vs=vs, only_mid_control=self.only_mid_control)
         
         return eps
     
@@ -177,10 +194,10 @@ class MutualAttentionControlledLDM(LatentDiffusion):
 
         return loss, loss_dict
     
-    def p_mean_variance(self, x_t, x_r, c_t, t, l_r, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
+    def p_mean_variance(self, x_t, x_r, c_t, t, l_r, clip_denoised: bool, locs=None, ks=None, vs=None, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
         t_in = t
-        model_out = self.apply_model(x_t, x_r, t_in, c_t, l_r, return_ids=return_codebook_ids)
+        model_out = self.apply_model(x_t, x_r, t_in, c_t, l_r, locs=locs, ks=ks, vs=vs, return_ids=return_codebook_ids)
 
         if score_corrector is not None:
             assert self.parameterization == "eps"
@@ -209,11 +226,12 @@ class MutualAttentionControlledLDM(LatentDiffusion):
             return model_mean, posterior_variance, posterior_log_variance
     
     @torch.no_grad()
-    def p_sample(self, x_t, x_r, c_t, t, l_r, clip_denoised=False, repeat_noise=False,
+    def p_sample(self, x_t, x_r, c_t, t, l_r, locs=None, ks=None, vs=None, clip_denoised=False, repeat_noise=False,
                  return_codebook_ids=False, quantize_denoised=False, return_x0=False,
                  temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None):
         b, *_, device = *x_t.shape, x_t.device
         outputs = self.p_mean_variance(x_t=x_t, x_r=x_r, c_t=c_t, t=t, l_r=l_r, clip_denoised=clip_denoised,
+                                       locs=locs, ks=ks, vs=vs,
                                        return_codebook_ids=return_codebook_ids,
                                        quantize_denoised=quantize_denoised,
                                        return_x0=return_x0,
@@ -240,7 +258,7 @@ class MutualAttentionControlledLDM(LatentDiffusion):
             return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
     
     @torch.no_grad()
-    def p_sample_loop(self, cond, reference, reference_location, shape, return_intermediates=False,
+    def p_sample_loop(self, cond, reference, reference_location, shape, locs=None, ks=None, vs=None, return_intermediates=False,
                       x_T=None, verbose=True, callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, start_T=None,
                       log_every_t=None):
@@ -274,7 +292,7 @@ class MutualAttentionControlledLDM(LatentDiffusion):
                 tc = self.cond_ids[ts].to(cond.device)
                 cond = self.q_sample(x_start=cond, t=tc, noise=torch.randn_like(cond))
 
-            img = self.p_sample(img, reference, cond, ts, reference_location,
+            img = self.p_sample(img, reference, cond, ts, reference_location, locs=locs, ks=ks, vs=vs,
                                 clip_denoised=self.clip_denoised,
                                 quantize_denoised=quantize_denoised)
             if mask is not None:
@@ -295,7 +313,7 @@ class MutualAttentionControlledLDM(LatentDiffusion):
         return self.get_learned_conditioning([""] * N)
 
     @torch.no_grad()
-    def sample(self, cond, reference, reference_location, batch_size=16, return_intermediates=False, x_T=None,
+    def sample(self, cond, reference, reference_location, locs=None, ks=None, vs=None, batch_size=16, return_intermediates=False, x_T=None,
                verbose=True, timesteps=None, quantize_denoised=False,
                mask=None, x0=None, shape=None, **kwargs):
         if shape is None:
@@ -310,6 +328,7 @@ class MutualAttentionControlledLDM(LatentDiffusion):
                                   reference,
                                   reference_location,
                                   shape,
+                                  locs=locs, ks=ks, vs=vs,
                                   return_intermediates=return_intermediates, x_T=x_T,
                                   verbose=verbose, timesteps=timesteps, quantize_denoised=quantize_denoised,
                                   mask=mask, x0=x0)

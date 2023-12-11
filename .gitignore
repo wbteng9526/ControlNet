@@ -6,6 +6,9 @@ image_log/
 models/*.ckpt
 models/*.py
 test/
+test_mutual/
+test_single/
+test_kf/
 
 *.pth
 *.pt

@@ -13,7 +13,7 @@ from ldm.modules.diffusionmodules.util import (
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from ldm.modules.attention import SpatialTransformer
-from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
+from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock, MutualAttentionUNetBlock
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -42,6 +42,52 @@ class ControlledUnetModel(UNetModel):
             h = module(h, emb, context)
 
         h = h.type(x.dtype)
+        return self.out(h)
+    
+class ReturnKVControlledUnetModel(MutualAttentionUNetBlock):
+    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
+        if self.return_kv:
+            self.ks, self.vs = None, None
+        hs, ks, vs = [], [], []
+        with torch.no_grad():
+            t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+            emb = self.time_embed(t_emb)
+            h = x.type(self.dtype)
+            for module in self.input_blocks:
+                if self.return_kv:
+                    h, k, v = module(h, emb, context)
+                    ks.append(k)
+                    vs.append(v)
+                else:
+                    h = module(h, emb, context)
+                hs.append(h)
+            
+            if self.return_kv:
+                h, k, v = self.middle_block(h, emb, context)
+                ks.append(k)
+                vs.append(v)
+            else:
+                h = self.middle_block(h, emb, context)
+
+        if control is not None:
+            h += control.pop()
+
+        for i, module in enumerate(self.output_blocks):
+            if only_mid_control or control is None:
+                h = torch.cat([h, hs.pop()], dim=1)
+            else:
+                h = torch.cat([h, hs.pop() + control.pop()], dim=1)
+            if self.return_kv:
+                h, k, v = module(h, emb, context)
+                ks.append(k)
+                vs.append(v)
+            else:
+                h = module(h, emb, context)
+
+        h = h.type(x.dtype)
+        if self.return_kv:
+            self.ks = ks
+            self.vs = vs
         return self.out(h)
 
 
