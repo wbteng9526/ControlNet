@@ -16,7 +16,7 @@ if __name__ == "__main__":
     single_model = single_model.cuda()
 
     mutual_model = create_model('./models/mutual_cldm_v15.yaml')
-    mutual_model.load_state_dict(load_state_dict('./lightning_logs/version_50/checkpoints/epoch=2-step=7016.ckpt', location='cuda'))
+    mutual_model.load_state_dict(load_state_dict('./models/mutual_fintune_control_epoch19.ckpt', location='cuda'))
     mutual_model = mutual_model.cuda()
 
     ddim_sampler = DDIMSampler(single_model)
@@ -26,8 +26,8 @@ if __name__ == "__main__":
         seq_name = f'seq_{seq:04d}'
         save_image = True
         save_video = True
-        save_image_dir = f'test/{seq_name}/image'
-        save_video_dir = f'test/{seq_name}/video'
+        save_image_dir = f'test/fintune_mutual_v1/{seq_name}/image'
+        save_video_dir = f'test/fintune_mutual_v1/{seq_name}/video'
         os.makedirs(save_image_dir, exist_ok=True)
         os.makedirs(save_video_dir, exist_ok=True)
 
@@ -73,4 +73,4 @@ if __name__ == "__main__":
                 img.save(os.path.join(save_image_dir, f'{i:03d}.png'))
         
         if save_video:
-            imageio.mimwrite(os.path.join(save_video_dir, 'video.mp4'), x_samples, fps=12)
+            imageio.mimwrite(os.path.join(save_video_dir, 'video.mp4'), x_samples, fps=4)

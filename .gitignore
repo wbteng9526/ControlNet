@@ -9,6 +9,8 @@ test/
 test_mutual/
 test_single/
 test_kf/
+test_control/
+test_finetune_mutual/
 
 *.pth
 *.pt
@@ -100,7 +102,7 @@ target/
 # IPython
 profile_default/
 ipython_config.py
-
+load_model.py
 # pyenv
 .python-version
 

@@ -47,27 +47,28 @@ class ControlledUnetModel(UNetModel):
 class ReturnKVControlledUnetModel(MutualAttentionUNetBlock):
     def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
         if self.return_kv:
-            self.ks, self.vs = None, None
-        hs, ks, vs = [], [], []
+            self.ks, self.vs = [], []
+        hs = []
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
             emb = self.time_embed(t_emb)
             h = x.type(self.dtype)
             for module in self.input_blocks:
-                if self.return_kv:
-                    h, k, v = module(h, emb, context)
-                    ks.append(k)
-                    vs.append(v)
-                else:
-                    h = module(h, emb, context)
+                h = module(h, emb, context)
+                if isinstance(h, tuple):
+                    h, k, v = h
+                    if self.return_kv:
+                        self.ks.append(k)
+                        self.vs.append(v)
                 hs.append(h)
             
-            if self.return_kv:
-                h, k, v = self.middle_block(h, emb, context)
-                ks.append(k)
-                vs.append(v)
-            else:
-                h = self.middle_block(h, emb, context)
+          
+            h = self.middle_block(h, emb, context)
+            if isinstance(h, tuple):
+                h, k, v = h
+                if self.return_kv:    
+                    self.ks.append(k)
+                    self.vs.append(v)
 
         if control is not None:
             h += control.pop()
@@ -77,17 +78,15 @@ class ReturnKVControlledUnetModel(MutualAttentionUNetBlock):
                 h = torch.cat([h, hs.pop()], dim=1)
             else:
                 h = torch.cat([h, hs.pop() + control.pop()], dim=1)
-            if self.return_kv:
+            h = module(h, emb, context)
+            if isinstance(h, tuple):
                 h, k, v = module(h, emb, context)
-                ks.append(k)
-                vs.append(v)
-            else:
-                h = module(h, emb, context)
+                if self.return_kv:
+                    self.ks.append(k)
+                    self.vs.append(v)
 
         h = h.type(x.dtype)
-        if self.return_kv:
-            self.ks = ks
-            self.vs = vs
+
         return self.out(h)
 
 
