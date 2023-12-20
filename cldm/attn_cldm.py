@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import LambdaLR
 import numpy as np
 from tqdm import tqdm
+import random
 
 from ldm.modules.diffusionmodules.util import (
     conv_nd,
@@ -36,10 +37,6 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
 
         if location is not None:
             emb_loc = self.loc_embed(location)
-            # if locs is not None:
-            #     emb_loc = (1. - self.omega_end - self.omega_start) * emb_loc + \
-            #         self.omega_start * self.loc_embed(locs[0]) + \
-            #         self.omega_end * self.loc_embed(locs[1])
             emb_r = th.cat([emb_r, emb_loc], dim=1)
         
         if x0_r is not None and x1_r is not None:
@@ -49,14 +46,35 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
             emb1_loc = self.loc_embed(loc1_r)
             emb1_r = th.cat([embo_r, emb1_loc], dim=1)
        
-        h_t, h_r = x_t.type(self.unet_target.dtype), x_r.type(self.unet_reference.dtype)
+        h_t= x_t.type(self.unet_target.dtype)
+        # input and middle blocks
+        if x_r is not None:
+            h_r = x_r.type(self.unet_reference.dtype)
 
-        k_r, v_r = None, None
-        for m_t, m_r in zip(self.unet_target.input_blocks, self.unet_reference.input_blocks):
-            h_r = m_r(h_r, emb_r, context=context_r)
+            k_r, v_r = None, None
+            for m_t, m_r in zip(self.unet_target.input_blocks, self.unet_reference.input_blocks):
+                h_r = m_r(h_r, emb_r, context=context_r)
+                if x0_r is not None and x1_r is not None:
+                    h0_r = m_r(h0_r, emb0_r, context=context_r)
+                    h1_r = m_r(h1_r, emb1_r, context=context_r)
+                if isinstance(h_r, tuple):
+                    h_r, k_r, v_r = h_r
+                    if x0_r is not None and x1_r is not None:
+                        h0_r, k0_r, v0_r = h0_r
+                        h1_r, k1_r, v1_r = h1_r
+                        k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
+                        v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
+                h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                hs_t.append(h_t)
+                hs_r.append(h_r)
+                if x0_r is not None and x1_r is not None:
+                    hs0_r.append(h0_r)
+                    hs1_r.append(h1_r)
+                
+            h_r = self.unet_reference.middle_block(h_r, emb_r, context=context_r)
             if x0_r is not None and x1_r is not None:
-                h0_r = m_r(h0_r, emb0_r, context=context_r)
-                h1_r = m_r(h1_r, emb1_r, context=context_r)
+                h0_r = self.unet_reference.middle_block(h0_r, emb0_r, context=context_r)
+                h1_r = self.unet_reference.middle_block(h1_r, emb1_r, context=context_r)
             if isinstance(h_r, tuple):
                 h_r, k_r, v_r = h_r
                 if x0_r is not None and x1_r is not None:
@@ -64,24 +82,88 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
                     h1_r, k1_r, v1_r = h1_r
                     k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
                     v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
+            h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+
+        else:
+            for m_t in self.unet_target.input_blocks:
+                h_t = m_t(h_t, emb_t, context=context_t, shared_k=None, shared_v=None)
+                hs_t.append(h_t)
+            h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=None, shared_v=None)
+        
+        if control is not None:
+            h_t += control.pop()
+
+        if x_r is not None:
+            for m_t, m_r in zip(self.unet_target.output_blocks, self.unet_reference.output_blocks):
+                h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r, context=context_r)
+                if x0_r is not None and x1_r is not None:
+                    h0_r = m_r(th.cat([h0_r, hs0_r.pop()], dim=1), emb0_r, context=context_r)
+                    h1_r = m_r(th.cat([h1_r, hs1_r.pop()], dim=1), emb1_r, context=context_r)
+                if isinstance(h_r, tuple):
+                    h_r, k_r, v_r = h_r
+                    if x0_r is not None and x1_r is not None:
+                        h0_r, k0_r, v0_r = h0_r
+                        h1_r, k1_r, v1_r = h1_r
+                        k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
+                        v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
+                if only_mid_control or control is None:
+                    h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                else:
+                    h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+        else:
+            for m_t in self.unet_target.output_blocks:
+                if only_mid_control or control is not None:
+                    h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=None, shared_v=None)
+                else:
+                    h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), emb_t, context=context_t, shared_k=None, shared_v=None)
+        del k_r, v_r
+        h_t = h_t.type(x_t.dtype)
+
+        if self.unet_target.predict_codebook_ids:
+            return self.unet_target.id_predictor(h_t)
+        else:
+            return self.unet_target.out(h_t)
+
+
+class MutualAttentionRandomControlledLDM(MutualAttentionUNetModel):
+    def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, control=None, loc0_r=None, loc1_r=None, x0_r=None, x1_r=None, only_mid_control=False, **kwargs):
+        choices = ['x_start', 'x_end', 'x_prev']
+        prob = [0.25, 0,25, 0.5]
+        selected_ref = random.choices(choices, weights=prob)
+
+        if selected_ref == 'x_start':
+            x_r = x0_r
+            location = loc0_r
+        elif selected_ref == 'x_end':
+            x_r = x1_r
+            location = loc1_r
+
+        hs_t, hs_r = [], []
+        if x0_r is not None and x1_r is not None:
+            hs0_r, hs1_r = [], []
+        t_emb = timestep_embedding(timesteps, self.unet_target.model_channels, repeat_only=False)
+        emb_t = self.unet_target.time_embed(t_emb)
+        emb_r = self.unet_reference.time_embed(t_emb)
+
+        if location is not None:
+            emb_loc = self.loc_embed(location)
+            emb_r = th.cat([emb_r, emb_loc], dim=1)
+       
+        h_t, h_r = x_t.type(self.unet_target.dtype), x_r.type(self.unet_reference.dtype)
+
+        k_r, v_r = None, None
+        for m_t, m_r in zip(self.unet_target.input_blocks, self.unet_reference.input_blocks):
+            h_r = m_r(h_r, emb_r, context=context_r)
+            if isinstance(h_r, tuple):
+                h_r, k_r, v_r = h_r
             h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             hs_t.append(h_t)
             hs_r.append(h_r)
-            if x0_r is not None and x1_r is not None:
-                hs0_r.append(h0_r)
-                hs1_r.append(h1_r)
             
         h_r = self.unet_reference.middle_block(h_r, emb_r, context=context_r)
-        if x0_r is not None and x1_r is not None:
-            h0_r = self.unet_reference.middle_block(h0_r, emb0_r, context=context_r)
-            h1_r = self.unet_reference.middle_block(h1_r, emb1_r, context=context_r)
         if isinstance(h_r, tuple):
             h_r, k_r, v_r = h_r
-            if x0_r is not None and x1_r is not None:
-                h0_r, k0_r, v0_r = h0_r
-                h1_r, k1_r, v1_r = h1_r
-                k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
-                v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
+
         h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
 
         if control is not None:
@@ -89,16 +171,8 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
 
         for m_t, m_r in zip(self.unet_target.output_blocks, self.unet_reference.output_blocks):
             h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r, context=context_r)
-            if x0_r is not None and x1_r is not None:
-                h0_r = m_r(th.cat([h0_r, hs0_r.pop()], dim=1), emb0_r, context=context_r)
-                h1_r = m_r(th.cat([h1_r, hs1_r.pop()], dim=1), emb1_r, context=context_r)
             if isinstance(h_r, tuple):
                 h_r, k_r, v_r = h_r
-                if x0_r is not None and x1_r is not None:
-                    h0_r, k0_r, v0_r = h0_r
-                    h1_r, k1_r, v1_r = h1_r
-                    k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
-                    v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
             if only_mid_control or control is None:
                 h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             else:

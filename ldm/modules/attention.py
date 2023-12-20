@@ -215,11 +215,12 @@ class SharedCrossAttention(CrossAttention):
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
         if self.shared_kv:
-            assert shared_k is not None and shared_v is not None
-            shared_k = rearrange(shared_k, 'b d i -> b i d')
-            shared_v = rearrange(shared_v, 'b d i -> b i d')
-            k = torch.cat([k, shared_k], dim=-2)
-            v = torch.cat([v, shared_v], dim=-2)
+            # assert shared_k is not None and shared_v is not None
+            if shared_k is not None and shared_v is not None:
+                shared_k = rearrange(shared_k, 'b d i -> b i d')
+                shared_v = rearrange(shared_v, 'b d i -> b i d')
+                k = torch.cat([k, shared_k], dim=-2)
+                v = torch.cat([v, shared_v], dim=-2)
         # force cast to fp32 to avoid overflowing
         if _ATTN_PRECISION =="fp32":
             with torch.autocast(enabled=False, device_type = 'cuda'):
