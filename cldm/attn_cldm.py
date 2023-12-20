@@ -47,6 +47,8 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
             emb1_r = th.cat([embo_r, emb1_loc], dim=1)
        
         h_t= x_t.type(self.unet_target.dtype)
+
+        k_r, v_r = None, None
         # input and middle blocks
         if x_r is not None:
             h_r = x_r.type(self.unet_reference.dtype)
@@ -116,7 +118,8 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
                     h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=None, shared_v=None)
                 else:
                     h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), emb_t, context=context_t, shared_k=None, shared_v=None)
-        del k_r, v_r
+        if exists(k_r) and exists(v_r):
+            del k_r, v_r
         h_t = h_t.type(x_t.dtype)
 
         if self.unet_target.predict_codebook_ids:
@@ -125,10 +128,10 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
             return self.unet_target.out(h_t)
 
 
-class MutualAttentionRandomControlledLDM(MutualAttentionUNetModel):
+class MutualAttentionRandomControlledUNetModel(MutualAttentionUNetModel):
     def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, control=None, loc0_r=None, loc1_r=None, x0_r=None, x1_r=None, only_mid_control=False, **kwargs):
         choices = ['x_start', 'x_end', 'x_prev']
-        prob = [0.25, 0,25, 0.5]
+        prob = [0.25, 0.25, 0.5]
         selected_ref = random.choices(choices, weights=prob)
 
         if selected_ref == 'x_start':

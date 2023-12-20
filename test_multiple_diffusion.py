@@ -28,22 +28,26 @@ def main():
     args = argparse.ArgumentParser()
     args.add_argument("--test_seqs", default=[1,7])
     args.add_argument("--exp_name", default="multidiff", required=True, help="name of the test experiment")
-    args.add_argument("--no_save_image", action="store_false")
-    args.add_argument("--no_save_video", action="store_false")
+    args.add_argument("--no_save_image", action="store_true")
+    args.add_argument("--no_save_video", action="store_true")
     args.add_argument("--clip_size", default=6, help="length of sub-video")
-    args.add_argument("--window_size", default=3, help="window size")
-
+    args.add_argument("--window_size", default=2, help="window size")
+    args = args.parse_args()
 
     model = create_model('./models/mutual_cldm_v15_infer.yaml')
-    model.load_state_dict(load_state_dict('./models/mutual_finetune_control_epoch19.ckpt', location="cuda"))
+    model.load_state_dict(load_state_dict('./models/mutual_finetune_control_epoch40.ckpt', location="cuda"))
     model = model.cuda()
 
+    single_control_model = create_model('./models/mutual_cldm_v15.yaml')
+    single_control_model.load_state_dict(load_state_dict('./models/mutual_finetune_control_epoch40.ckpt', location="cuda"))
+    single_control_model = single_control_model.cuda()
+
     if not args.no_save_image:
-        save_image_dir = os.path.join("exp", args.exp_name, "image")
+        save_image_dir = os.path.join("./exp", args.exp_name, "image")
         os.makedirs(save_image_dir, exist_ok=True)
     
     if not args.no_save_video:
-        save_video_dir = os.path.join("exp", args.exp_name, "video")
+        save_video_dir = os.path.join("./exp", args.exp_name, "video")
         os.makedirs(save_video_dir, exist_ok=True)
     
     seq_names = args.test_seqs
@@ -60,10 +64,10 @@ def main():
         print("====================")
 
         if not args.no_save_image:
-            os.makedirs(os.path.join(save_image_dir, seq_name))
+            os.makedirs(os.path.join(save_image_dir, seq_name), exist_ok=True)
         
         if not args.no_save_video:
-            os.makedirs(os.path.join(save_video_dir, seq_name))
+            os.makedirs(os.path.join(save_video_dir, seq_name), exist_ok=True)
         
         print("Loading data ...")
         dataset = MyDataset(seq_name)
@@ -77,7 +81,7 @@ def main():
             start_cond_txt, start_control, start_ref_loc, shape = get_data_info(dataset.__getitem__(start_frame))
             end_cond_txt, end_control, end_ref_loc, _ = get_data_info(dataset.__getitem__(end_frame))
 
-            start_sample = model.sample(
+            start_sample = single_control_model.sample(
                 cond={"c_t_crossattn": [model.get_learned_conditioning(start_cond_txt)], "c_t_concat": [start_control]},
                 reference=None,
                 reference_location=None,
@@ -104,12 +108,12 @@ def main():
                 shape=shape
             )
             end_sample = model.decode_first_stage(end_sample)
-            encoder_posterior = model.encoder_first_stage(end_sample)
+            encoder_posterior = model.encode_first_stage(end_sample)
             reference_end = model.get_first_stage_encoding(encoder_posterior)
 
             prev_ref_loc = start_ref_loc
 
-            while end_frame < len(dataset):
+            while end_frame < len(dataset) - 1:
                 print(f"Sampling from frame {start_frame + 1} to frame {end_frame}")
                 for i in range(start_frame + 1, end_frame + 1):
                     data_dict = dataset.__getitem__(i)
@@ -139,15 +143,22 @@ def main():
                     else:
                         x_samples[i] = [cur_sample]
                 
-                print("Calculating the average from frames", [i for i in range(start_frame, start_frame + args.window_size + 1)])
-                for i in range(start_frame, start_frame + args.window_size + 1):
+                print("Calculating the average of frames", [i for i in range(start_frame + 1, start_frame + args.window_size + 1)])
+                for i in range(start_frame + 1, start_frame + args.window_size + 1):
                     done_sample = x_samples[i]
                     done_tensor = torch.stack(done_sample, dim=0)
                     done_tensor = done_tensor.mean(dim=0)
                     x_samples[i] = done_tensor
+                    x_sample = (einops.rearrange(done_tensor, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+                    if not args.no_save_image:
+                        img = Image.fromarray(x_sample[0])
+                        img.save(os.path.join(save_image_dir, seq_name, f"{i:03d}.png"))
                 
                 start_frame += args.window_size
                 end_frame = start_frame + args.clip_size
+
+                if end_frame >= len(dataset):
+                    end_frame = len(dataset) - 1
 
                 start_cond_txt, start_control, start_ref_loc, shape = get_data_info(dataset.__getitem__(start_frame))
                 end_cond_txt, end_control, end_ref_loc, _ = get_data_info(dataset.__getitem__(end_frame))
@@ -169,26 +180,27 @@ def main():
                 )
 
                 end_sample = model.decode_first_stage(end_sample)
-                encoder_posterior = model.encoder_first_stage(end_sample)
+                encoder_posterior = model.encode_first_stage(end_sample)
                 reference_end = model.get_first_stage_encoding(encoder_posterior)
 
                 prev_ref_loc = start_ref_loc
 
-            video = []
-            for i in range(sorted(x_samples.keys())):
+            for i in sorted(x_samples.keys()):
                 x_sample = x_samples[i]
                 if isinstance(x_sample, list):
                     x_sample = torch.stack(x_sample)
                     x_sample = x_sample.mean(dim=0)
                 
-                x_sample = (einops.rearrange(x_sample, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
-                if not args.no_save_image:
-                    img = Image.fromarray(x_sample[0])
-                    img.save(os.path.join(save_image_dir, seq_name, f"{i:03d}.png"))
-                video.append(x_sample[0])
+                    x_sample = (einops.rearrange(x_sample, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+                    if not args.no_save_image:
+                        img = Image.fromarray(x_sample[0])
+                        img.save(os.path.join(save_image_dir, seq_name, f"{i:03d}.png"))
             
-            if not args.no_save_vide:
-                imageio.mimwrite(os.path.join(save_video_dir, seq_name, 'video.mp4'), video, fps=4)
+            # for i in range(sorted(x_samples.keys())):
+            #         video.append(x_sample[0])
+            
+            # if not args.no_save_video:
+            #     imageio.mimwrite(os.path.join(save_video_dir, seq_name, 'video.mp4'), video, fps=4)
 
 if __name__ == "__main__":
     main()

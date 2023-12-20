@@ -11,6 +11,7 @@ test_single/
 test_kf/
 test_control/
 test_finetune_mutual/
+exp/
 
 *.pth
 *.pt
