@@ -24,6 +24,14 @@ from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_t
 from ldm.models.diffusion.ddim import DDIMSampler
 
 
+def get_weights(loc, loc0, loc1):
+    d = th.norm(loc, dim=-1)
+    d0 = th.norm(loc0, dim=-1)
+    d1 = th.norm(loc1, dim=-1)
+    denom = (1./d) + (1./d0) + (1./d1)
+    return 1./d/denom, 1./d0/denom, 1./d1/denom
+
+
 class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
     def forward(self, x_t, x_r, timesteps=None, context_t=None, context_r=None, location=None, control=None, loc0_r=None, loc1_r=None, x0_r=None, x1_r=None, only_mid_control=False, **kwargs):
         hs_t, hs_r = [], []
@@ -45,10 +53,12 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
             emb0_r = th.cat([embo_r, emb0_loc], dim=1)
             emb1_loc = self.loc_embed(loc1_r)
             emb1_r = th.cat([embo_r, emb1_loc], dim=1)
+            w, w0, w1 = get_weights(location, loc0_r, loc1_r)
        
-        h_t= x_t.type(self.unet_target.dtype)
+        h_t = x_t.type(self.unet_target.dtype)
 
-        k_r, v_r = None, None
+        k_r, v_r, loc_emb = None, None, None
+        loc_emb0, loc_emb1 = None, None
         # input and middle blocks
         if x_r is not None:
             h_r = x_r.type(self.unet_reference.dtype)
@@ -60,13 +70,28 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
                     h0_r = m_r(h0_r, emb0_r, context=context_r)
                     h1_r = m_r(h1_r, emb1_r, context=context_r)
                 if isinstance(h_r, tuple):
-                    h_r, k_r, v_r = h_r
+                    if len(h_r) == 3:
+                        h_r, k_r, v_r = h_r
+                    elif len(h_r) == 2:
+                        h_r, loc_emb = h_r
+                    else:
+                        raise ValueError("Dimension of tuple is not correct")
                     if x0_r is not None and x1_r is not None:
-                        h0_r, k0_r, v0_r = h0_r
-                        h1_r, k1_r, v1_r = h1_r
-                        k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
-                        v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
-                h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                        if len(h0_r) == 3 and len(h1_r) == 3:
+                            h0_r, k0_r, v0_r = h0_r
+                            h1_r, k1_r, v1_r = h1_r
+                            k_r = w0 * k0_r + w1 * k1_r + (1. - w0 - w1) * k_r
+                            v_r = w0 * v0_r + w1 * v1_r + (1. - w0 - w0) * v_r
+                        elif len(h0_r) == 2 and len(h1_r) == 2:
+                            h0_r, loc_emb0 = h0_r
+                            h1_r, loc_emb1 = h1_r
+                if exists(loc_emb):
+                    if exists(loc_emb0) and exists(loc_emb1):
+                        loc_emb = w0 * loc_emb0 + w1 * loc_emb1 + (1. - w0 - w1) * loc_emb
+                    # print(emb_t.shape, loc_emb.shape)
+                    h_t = m_t(h_t, th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+                else:
+                    h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
                 hs_t.append(h_t)
                 hs_r.append(h_r)
                 if x0_r is not None and x1_r is not None:
@@ -78,13 +103,28 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
                 h0_r = self.unet_reference.middle_block(h0_r, emb0_r, context=context_r)
                 h1_r = self.unet_reference.middle_block(h1_r, emb1_r, context=context_r)
             if isinstance(h_r, tuple):
-                h_r, k_r, v_r = h_r
+                if len(h_r) == 3:
+                    h_r, k_r, v_r = h_r
+                elif len(h_r) == 2:
+                    h_r, loc_emb = h_r
+                else:
+                    raise ValueError("Dimension of tuple is not correct")
                 if x0_r is not None and x1_r is not None:
-                    h0_r, k0_r, v0_r = h0_r
-                    h1_r, k1_r, v1_r = h1_r
-                    k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
-                    v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
-            h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                    if len(h0_r) == 3 and len(h1_r) == 3:
+                        h0_r, k0_r, v0_r = h0_r
+                        h1_r, k1_r, v1_r = h1_r
+                        k_r = w0 * k0_r + w1 * k1_r + (1. - w0 - w1) * k_r
+                        v_r = w0 * v0_r + w1 * v1_r + (1. - w0 - w0) * v_r
+                    elif len(h0_r) == 2 and len(h1_r) == 2:
+                        h0_r, loc_emb0 = h0_r
+                        h1_r, loc_emb1 = h1_r
+            if exists(loc_emb):
+                if exists(loc_emb0) and exists(loc_emb1):
+                    loc_emb = w0 * loc_emb0 + w1 * loc_emb1 + (1. - w0 - w1) * loc_emb
+                # print(emb_t.shape, loc_emb.shape)
+                h_t = self.unet_target.middle_block(h_t, th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+            else:
+                h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
 
         else:
             for m_t in self.unet_target.input_blocks:
@@ -97,21 +137,43 @@ class MutualAttentionControlledUNetModel(MutualAttentionUNetModel):
 
         if x_r is not None:
             for m_t, m_r in zip(self.unet_target.output_blocks, self.unet_reference.output_blocks):
+                loc_emb = None
                 h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r, context=context_r)
                 if x0_r is not None and x1_r is not None:
                     h0_r = m_r(th.cat([h0_r, hs0_r.pop()], dim=1), emb0_r, context=context_r)
                     h1_r = m_r(th.cat([h1_r, hs1_r.pop()], dim=1), emb1_r, context=context_r)
                 if isinstance(h_r, tuple):
-                    h_r, k_r, v_r = h_r
+                    if len(h_r) == 3:
+                        h_r, k_r, v_r = h_r
+                    elif len(h_r) == 2:
+                        h_r, loc_emb = h_r
+                        # print(loc_emb.shape)
+                    else:
+                        raise ValueError("Dimension of tuple is not correct")
                     if x0_r is not None and x1_r is not None:
-                        h0_r, k0_r, v0_r = h0_r
-                        h1_r, k1_r, v1_r = h1_r
-                        k_r = self.omega_start * k0_r + self.omega_end * k1_r + (1. - self.omega_end - self.omega_start) * k_r
-                        v_r = self.omega_start * v0_r + self.omega_end * v1_r + (1. - self.omega_end - self.omega_start) * v_r
+                        if len(h0_r) == 3 and len(h1_r) == 3:
+                            h0_r, k0_r, v0_r = h0_r
+                            h1_r, k1_r, v1_r = h1_r
+                            k_r = w0 * k0_r + w1 * k1_r + (1. - w0 - w1) * k_r
+                            v_r = w0 * v0_r + w1 * v1_r + (1. - w0 - w0) * v_r
+                        elif len(h0_r) == 2 and len(h1_r) == 2:
+                            h0_r, loc_emb0 = h0_r
+                            h1_r, loc_emb1 = h1_r
                 if only_mid_control or control is None:
-                    h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                    if exists(loc_emb):
+                        if exists(loc_emb0) and exists(loc_emb1):
+                            loc_emb = w0 * loc_emb0 + w1 * loc_emb1 + (1. - w0 - w1) * loc_emb
+                        h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+                    else:
+                        h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
                 else:
-                    h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                    if exists(loc_emb):
+                        if exists(loc_emb0) and exists(loc_emb1):
+                            loc_emb = w0 * loc_emb0 + w1 * loc_emb1 + (1. - w0 - w1) * loc_emb
+                        # print(emb_t.shape, loc_emb.shape)
+                        h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+                    else:
+                        h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
         else:
             for m_t in self.unet_target.output_blocks:
                 if only_mid_control or control is not None:
@@ -154,35 +216,63 @@ class MutualAttentionRandomControlledUNetModel(MutualAttentionUNetModel):
        
         h_t, h_r = x_t.type(self.unet_target.dtype), x_r.type(self.unet_reference.dtype)
 
-        k_r, v_r = None, None
+        k_r, v_r, loc_emb = None, None, None
         for m_t, m_r in zip(self.unet_target.input_blocks, self.unet_reference.input_blocks):
             h_r = m_r(h_r, emb_r, context=context_r)
             if isinstance(h_r, tuple):
-                h_r, k_r, v_r = h_r
-            h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                if len(h_r) == 3:
+                    h_r, k_r, v_r = h_r
+                elif len(h_r) == 2:
+                    h_r, loc_emb = h_r
+                else:
+                    raise ValueError("Dimension of tuple is not correct")
+            if exists(loc_emb):
+                h_t = m_t(h_t, th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+            else:
+                h_t = m_t(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             hs_t.append(h_t)
             hs_r.append(h_r)
             
         h_r = self.unet_reference.middle_block(h_r, emb_r, context=context_r)
         if isinstance(h_r, tuple):
-            h_r, k_r, v_r = h_r
+            if len(h_r) == 3:
+                h_r, k_r, v_r = h_r
+            elif len(h_r) == 2:
+                h_r, loc_emb = h_r
+            else:
+                raise ValueError("Dimension of tuple is not correct")
 
-        h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+        if exists(loc_emb):
+            h_t = self.unet_target.middle_block(h_t, th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+        else:
+            h_t = self.unet_target.middle_block(h_t, emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
 
         if control is not None:
             h_t += control.pop()
 
         for m_t, m_r in zip(self.unet_target.output_blocks, self.unet_reference.output_blocks):
+            loc_emb = None
             h_r = m_r(th.cat([h_r, hs_r.pop()], dim=1), emb_r, context=context_r)
             if isinstance(h_r, tuple):
-                h_r, k_r, v_r = h_r
+                if len(h_r) == 3:
+                    h_r, k_r, v_r = h_r
+                elif len(h_r) == 2:
+                    h_r, loc_emb = h_r
+                else:
+                    raise ValueError("Dimension of tuple is not correct")
             if only_mid_control or control is None:
-                h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+                if exists(loc_emb):
+                    h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+                else:
+                    h_t = m_t(th.cat([h_t, hs_t.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
             else:
-                h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
-
-        del k_r, v_r
-        h_r, h_t = h_r.type(x_r.dtype), h_t.type(x_t.dtype)
+                if exists(loc_emb):
+                    h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), th.cat([emb_t, loc_emb], dim=1), context=context_t, shared_k=k_r, shared_v=v_r)
+                else:
+                    h_t = m_t(th.cat([h_t, hs_t.pop() + control.pop()], dim=1), emb_t, context=context_t, shared_k=k_r, shared_v=v_r)
+        if exists(k_r) and exists(v_r):
+            del k_r, v_r
+        h_t = h_t.type(x_t.dtype)
 
         if self.unet_target.predict_codebook_ids:
             return self.unet_target.id_predictor(h_t)
@@ -372,6 +462,8 @@ class MutualAttentionControlledLDM(LatentDiffusion):
             img = torch.randn(shape, device=device)
         else:
             img = x_T
+            ts = torch.full((b,), 999, device=device, dtype=torch.long)
+            img = self.q_sample(x_T, ts, noise=torch.randn_like(x_T))
 
         intermediates = [img]
         if timesteps is None:
@@ -516,7 +608,11 @@ class MutualAttentionControlledLDM(LatentDiffusion):
         
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = self.model.diffusion_model.unet_reference.parameters()
+        params = list(self.model.diffusion_model.unet_reference.parameters())
+        params += list(self.model.diffusion_model.unet_target.parameters())
+        params += list(self.model.diffusion_model.loc_embed.parameters())
+        if not self.control_locked:
+            params += list(self.control_model.parameters())
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
             params = params + list(self.cond_stage_model.parameters())

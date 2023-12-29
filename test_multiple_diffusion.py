@@ -11,9 +11,11 @@ from tutorial_dataset_test import MyDataset
 from cldm.model import create_model, load_state_dict
 from cldm.ddim_hacked import DDIMSampler
 
+device = torch.device("cuda")
+
 def get_data_info(data_dict):
     cond_txt = data_dict['txt']
-    control = torch.from_numpy(data_dict['hint']).float().cuda()
+    control = torch.from_numpy(data_dict['hint']).float().to(device)
     control = control.unsqueeze(0)
     control = einops.rearrange(control, 'b h w c -> b c h w')
     _, C, H, W = control.shape
@@ -26,20 +28,20 @@ def get_data_info(data_dict):
 
 def main():
     args = argparse.ArgumentParser()
-    args.add_argument("--test_seqs", default=[1,7])
+    args.add_argument("--test_seqs", default=[1,5,7])
     args.add_argument("--exp_name", default="multidiff", required=True, help="name of the test experiment")
     args.add_argument("--no_save_image", action="store_true")
     args.add_argument("--no_save_video", action="store_true")
-    args.add_argument("--clip_size", default=6, help="length of sub-video")
-    args.add_argument("--window_size", default=2, help="window size")
+    args.add_argument("--clip_size",type=int, default=6, help="length of sub-video")
+    args.add_argument("--window_size", type=int, default=2, help="window size")
     args = args.parse_args()
 
-    model = create_model('./models/mutual_cldm_v15_infer.yaml')
-    model.load_state_dict(load_state_dict('./models/mutual_finetune_control_epoch40.ckpt', location="cuda"))
+    model = create_model('./models/mutual_cldm_v15.yaml')
+    model.load_state_dict(load_state_dict('./lightning_logs/version_73/checkpoints/epoch=19-step=62379.ckpt', location="cuda"))
     model = model.cuda()
 
-    single_control_model = create_model('./models/mutual_cldm_v15.yaml')
-    single_control_model.load_state_dict(load_state_dict('./models/mutual_finetune_control_epoch40.ckpt', location="cuda"))
+    single_control_model = create_model('./models/cldm_v15.yaml')
+    single_control_model.load_state_dict(load_state_dict('./models/single_control_epoch12.ckpt', location='cuda'))
     single_control_model = single_control_model.cuda()
 
     if not args.no_save_image:
@@ -82,9 +84,7 @@ def main():
             end_cond_txt, end_control, end_ref_loc, _ = get_data_info(dataset.__getitem__(end_frame))
 
             start_sample = single_control_model.sample(
-                cond={"c_t_crossattn": [model.get_learned_conditioning(start_cond_txt)], "c_t_concat": [start_control]},
-                reference=None,
-                reference_location=None,
+                cond={"c_crossattn": [single_control_model.get_learned_conditioning(start_cond_txt)], "c_concat": [start_control]},
                 batch_size=1,
                 return_intermediates=False,
                 verbose=True,
@@ -97,6 +97,18 @@ def main():
             reference_start = reference_prev.clone()
 
             x_samples[0] = [start_sample]
+            x_sample = (einops.rearrange(start_sample, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+            if not args.no_save_image:
+                img = Image.fromarray(x_sample[0])
+                img.save(os.path.join(save_image_dir, seq_name, "000.png"))
+            
+            end_single_sample = single_control_model.sample(
+                cond={"c_crossattn": [single_control_model.get_learned_conditioning(end_cond_txt)], "c_concat": [end_control]},
+                batch_size=1,
+                return_intermediates=False,
+                verbose=True,
+                shape=shape
+            )
 
             end_sample = model.sample(
                 cond={"c_t_crossattn": [model.get_learned_conditioning(end_cond_txt)], "c_t_concat": [end_control]},
@@ -104,6 +116,7 @@ def main():
                 reference_location=start_ref_loc - end_ref_loc,
                 batch_size=1,
                 return_intermediates=False,
+                x_T=end_single_sample,
                 verbose=True,
                 shape=shape
             )
@@ -120,6 +133,14 @@ def main():
 
                     cond_txt, control, ref_loc, _ = get_data_info(data_dict)
 
+                    cur_single_sample = single_control_model.sample(
+                        cond={"c_crossattn": [model.get_learned_conditioning(cond_txt)], "c_concat": [control]},
+                        batch_size=1,
+                        return_intermediates=False,
+                        verbose=True,
+                        shape=shape
+                    )
+       
                     cur_sample = model.sample(
                         cond={"c_t_crossattn": [model.get_learned_conditioning(cond_txt)], "c_t_concat": [control]},
                         reference=reference_prev,
@@ -130,6 +151,7 @@ def main():
                         x1_r=reference_end,
                         batch_size=1,
                         return_intermediates=False,
+                        x_T=cur_single_sample,
                         verbose=True,
                         shape=shape
                     )
@@ -169,12 +191,21 @@ def main():
 
                 reference_start = reference_prev.clone()
 
+                end_single_sample = single_control_model.sample(
+                    cond={"c_crossattn": [single_control_model.get_learned_conditioning(end_cond_txt)], "c_concat": [end_control]},
+                    batch_size=1,
+                    return_intermediates=False,
+                    verbose=True,
+                    shape=shape
+                )
+
                 end_sample = model.sample(
                     cond={"c_t_crossattn": [model.get_learned_conditioning(end_cond_txt)], "c_t_concat": [end_control]},
                     reference=reference_start,
                     reference_location=start_ref_loc - end_ref_loc,
                     batch_size=1,
                     return_intermediates=False,
+                    x_T=end_single_sample,
                     verbose=True,
                     shape=shape
                 )

@@ -9,13 +9,14 @@ from cldm.model import create_model, load_state_dict
 
 # Configs
 if __name__ == "__main__":
-    resume_path = None # './models/control_sd15_ini.ckpt'
+    resume_path = 'lightning_logs/version_73/checkpoints/epoch=19-step=62379.ckpt'
     single_model_path = './models/single_control_epoch12.ckpt'
     first_stage_path = './models/kl_f8.ckpt'
-    batch_size = 2
-    logger_freq = 1000
+    batch_size = 1
+    logger_freq = 2000
     learning_rate = 1e-5
     sd_locked = True
+    control_locked = False
     only_mid_control = False
 
 
@@ -54,22 +55,6 @@ if __name__ == "__main__":
                 if adapted_key in model.model.diffusion_model.unet_target.state_dict().keys():
                     unet_dict[adapted_key] = single_model_state_dict[key]
         
-        f_first = open("first_params.txt", "w")
-        for k1, k2 in zip(first_stage_dict.keys(), model.first_stage_model.state_dict().keys()):
-            f_first.write(k1 + "    " + k2 + '\n')
-        
-        f_cond = open("cond_params.txt", "w")
-        for k1, k2 in zip(cond_stage_dict.keys(), model.cond_stage_model.state_dict().keys()):
-            f_cond.write(k1 + "    " + k2 + '\n')
-        
-        f_control = open("control_params.txt", "w")
-        for k1, k2 in zip(control_stage_dict.keys(), model.control_model.state_dict().keys()):
-            f_control.write(k1 + "    " + k2 + '\n')
-        
-        f_unet = open("unet_params.txt", "w")
-        for k1, k2 in zip(unet_dict.keys(), model.model.diffusion_model.unet_target.state_dict().keys()):
-            f_unet.write(k1 + "    " + k2 + '\n')
-        
         model.first_stage_model.load_state_dict(first_stage_dict)
         model.cond_stage_model.load_state_dict(cond_stage_dict)
         model.control_model.load_state_dict(control_stage_dict)
@@ -77,6 +62,7 @@ if __name__ == "__main__":
 
     model.learning_rate = learning_rate
     model.sd_locked = sd_locked
+    model.control_locked = control_locked
     model.only_mid_control = only_mid_control
 
 

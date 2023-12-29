@@ -122,10 +122,12 @@ class MutualTimestepEmbedSequential(nn.Sequential, TimestepBlock):
 
 class SharedTimestepEmbedSequential(nn.Sequential, TimestepBlock):
     def forward(self, x, emb, context=None, shared_k=None, shared_v=None):
-        k, v = None, None
+        k, v, loc_emb = None, None, None
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
+                if isinstance(x, tuple):
+                    x, loc_emb = x
             elif isinstance(layer, SharedSpatialTransformer):
                 x = layer(x, shared_k, shared_v, context=context)
                 if isinstance(x, tuple):
@@ -138,6 +140,8 @@ class SharedTimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 x = layer(x)
         if exists(k) and exists(v):
             return x, k, v
+        if exists(loc_emb):
+            return x, loc_emb
         return x
 
 class Upsample(nn.Module):
@@ -313,9 +317,17 @@ class ResBlock(TimestepBlock):
             h = in_conv(h)
         else:
             h = self.in_layers(x)
+        
+        if emb.shape[1] == 2 * self.emb_channels:
+            emb, loc_emb = th.chunk(emb, chunks=2, dim=1)
+        else:
+            loc_emb = None
         emb_out = self.emb_layers(emb).type(h.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
+        if exists(loc_emb):
+            while len(loc_emb.shape) < len(h.shape):
+                loc_emb = loc_emb[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = th.chunk(emb_out, 2, dim=1)
@@ -323,6 +335,9 @@ class ResBlock(TimestepBlock):
             h = out_rest(h)
         else:
             h = h + emb_out
+            if exists(loc_emb):
+
+                h += loc_emb
             h = self.out_layers(h)
         return self.skip_connection(x) + h
 
@@ -354,17 +369,19 @@ class ResBlockLocationAware(ResBlock):
         loc_emb_out = self.loc_emb_layers(loc_emb).type(h.dtype)
         while len(time_emb_out.shape) < len(h.shape):
             time_emb_out = time_emb_out[..., None]
-        while len(loc_emb_out.shape) < len(h.shape):
-            loc_emb_out = loc_emb_out[..., None]
+        # while len(loc_emb_out.shape) < len(h.shape):
+        #     loc_emb_out = loc_emb_out[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = th.chunk(time_emb_out, 2, dim=1)
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
         else:
-            h = h + time_emb_out + loc_emb_out
+            # print("time:", time_emb_out.shape)
+            # print("loc:", loc_emb_out.shape)
+            h = h + time_emb_out
             h = self.out_layers(h)
-        return self.skip_connection(x) + h
+        return self.skip_connection(x) + h, loc_emb_out
 
 
 
